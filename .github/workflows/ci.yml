@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - "**"  # release.yml covers tag pushes; avoid double-running verify
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs tag history to resolve the version
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run pytest

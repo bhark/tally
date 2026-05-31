@@ -1,0 +1,16 @@
+# tally runtime output (scratch when running the tool in-place)
+talos-secrets/
+talos/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+build/
+dist/
+.venv/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/

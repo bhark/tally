@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tally"
+dynamic = ["version"]
+description = "Terminal wizard for bringing up Talos on Hetzner Robot dedicated servers"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Adrian E. Bratlann", email = "adrian@forn.dk" }]
+keywords = ["talos", "kubernetes", "hetzner", "bare-metal", "bootstrap"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Installation/Setup",
+]
+dependencies = [
+    "griphtui>=0.2.2",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bhark/tally"
+Repository = "https://github.com/bhark/tally"
+Issues = "https://github.com/bhark/tally/issues"
+
+[project.scripts]
+tally = "tally.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tally"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
