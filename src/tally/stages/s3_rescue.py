@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import shutil
 
-from griphtui import confirm, error, is_cancel, note, text
+from griphtui import Option, confirm, error, is_cancel, note, select, text
 
 from .. import probe, remote
 from ..model import Node, Stage
 from ..ui import gap
 from .base import Ctx, StageCancelled, StageDef
 
-_BOOT_TIMEOUT = 180  # dd'd node POSTing + booting into maintenance mode; generous
+_BOOT_TIMEOUT = 300  # bare-metal POST + fresh-disk boot; match the apply-reboot budget
 _SSH_PORT = 22
 _RESCUE_TIMEOUT = 300  # rescue ramdisk boot can lag well behind the operator's confirm
 
@@ -129,22 +129,35 @@ sync"""
 
 
 def _await_talos(ctx: Ctx, node: Node) -> None:
-    """Poll the insecure Talos API until the node answers in maintenance mode."""
+    """Poll the insecure Talos API until the node answers in maintenance mode.
+
+    A slow bare-metal POST can outlast one window, so a timeout loops back to re-poll rather
+    than abort: re-running would re-classify the node as absent and re-image it (see _open).
+    """
     if not node.ip or shutil.which("talosctl") is None:
         note("Cannot probe; assuming the node comes up, apply will confirm")
         return
     cmd = ["talosctl", "-n", node.ip, "get", "disks", "--insecure"]
-    label = f"Waiting for {node.name} to boot into Talos (≤{_BOOT_TIMEOUT // 60}m)"
-    if probe.wait_until(cmd, ctx.talos_env(), label, timeout=_BOOT_TIMEOUT):
-        note(f"{node.name} up in maintenance mode → ready to apply")
-        return
-    if not _require(
-        confirm(
-            f"{node.name} unreachable after {_BOOT_TIMEOUT // 60}m; continue anyway?",
-            default=False,
+    while True:
+        label = f"Waiting for {node.name} to boot into Talos (≤{_BOOT_TIMEOUT // 60}m)"
+        if probe.wait_until(cmd, ctx.talos_env(), label, timeout=_BOOT_TIMEOUT):
+            note(f"{node.name} up in maintenance mode → ready to apply")
+            return
+        gap()
+        choice = _require(
+            select(
+                f"{node.name} unreachable after {_BOOT_TIMEOUT // 60}m",
+                [
+                    Option(label="Keep waiting", value="wait"),
+                    Option(label="Continue anyway (apply will confirm)", value="go"),
+                    Option(label="Abort", value="abort"),
+                ],
+            )
         )
-    ):
-        raise StageCancelled("Node did not reach maintenance mode")
+        if choice == "go":
+            return
+        if choice == "abort":
+            raise StageCancelled("Node did not reach maintenance mode")
 
 
 STAGE = StageDef(
