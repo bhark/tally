@@ -527,8 +527,14 @@ def _ask_selector(default: dict[str, str]) -> InstallTarget | None:
 
 
 def _ask_extra_patches(default: list[str]) -> list[str] | None:
+    """Opt-in bring-your-own --config-patch files. Cancel ⇒ None (abort add), no ⇒ []."""
+    answer = confirm("Add bring-your-own config-patch files?", default=bool(default))
+    if is_cancel(answer):
+        return None
+    if not answer:
+        return []
     raw = _ask_text(
-        "Extra config-patch files (comma-separated, blank for none; see presets/)",
+        "Patch file path(s), comma-separated (relative to where you run tally)",
         default=", ".join(default),
     )
     if raw is None:

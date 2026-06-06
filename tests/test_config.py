@@ -111,17 +111,21 @@ def test_selector_target_emits_quoted_diskselector():
 def test_generic_profile_adds_no_fragments():
     machine = _machine_patch(_node(profile=ProfileKey.GENERIC), None)["machine"]
     assert "kernel" not in machine and "kubelet" not in machine and "sysctls" not in machine
+    assert "nodeLabels" not in machine
 
 
 def test_db_profile_fragments_land_in_role_patch():
     machine = _machine_patch(_node(profile=ProfileKey.DB), None)["machine"]
     assert machine["kernel"]["modules"] == [{"name": "dm_mod"}]
     assert machine["kubelet"]["extraMounts"] == [TOPOLVM_MOUNT]
+    assert machine["nodeLabels"] == {"workload": "db"}
 
 
 def test_storage_profile_loads_rbd():
     machine = _machine_patch(_node(profile=ProfileKey.STORAGE), None)["machine"]
     assert machine["kernel"]["modules"] == [{"name": "rbd"}]
+    assert machine["nodeLabels"] == {"workload": "storage"}
+    assert machine["sysctls"] == {"fs.aio-max-nr": "1048576"}
 
 
 # vswitch ---------------------------------------------------------------------

@@ -136,10 +136,10 @@ def _matches(row: dict, dtype: str) -> bool:
     if dtype == "nvme":
         return row.get("tran") == "nvme"
     if dtype == "ssd":
-        return not _is_rotational(row)
+        return not _is_rotational(row) and row.get("tran") != "nvme"  # talos: ssd excludes nvme
     if dtype == "hdd":
         return _is_rotational(row)
-    if dtype == "sd":
+    if dtype == "sd":  # unverified vs talos sd-card semantics; unused here
         return str(row.get("name", "")).startswith("sd")
     return False
 
@@ -147,10 +147,10 @@ def _matches(row: dict, dtype: str) -> bool:
 def select_disk(install: InstallTarget, disks: list[dict]) -> str:
     """Resolve the dd target /dev path: explicit disk wins, else first selector match.
 
-    Filters lsblk's whole-disk rows by the install selector's type and returns the
-    lowest-named match (nvme0n1 before nvme1n1). The dd target only needs to be a disk
-    the BIOS will boot; install.diskSelector is re-pinned post-boot from Talos' own
-    SystemDisk (see disk.resolve_system_selector).
+    Filters lsblk's whole-disk rows by the install selector's type (matched per Talos'
+    own semantics - ssd excludes nvme) and returns the lowest-named match (nvme0n1 before
+    nvme1n1). The dd target only needs to be a disk the BIOS will boot; install.diskSelector
+    is re-pinned post-boot from Talos' own SystemDisk (see disk.resolve_system_selector).
     """
     if install.disk:
         return install.disk

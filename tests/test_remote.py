@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from tally import remote
+from tally.model import InstallTarget
 from tally.runner import CommandResult
 
 
@@ -36,3 +37,28 @@ def test_verify_rescue_aborts_on_installed_os(monkeypatch):
     monkeypatch.setattr(remote, "exec", lambda *a, **k: _result(_INSTALLED))
     with pytest.raises(remote.RemoteError, match="not a rescue ramdisk"):
         remote.verify_rescue(remote.Session(host="1.2.3.4", tmp="/tmp/x"))
+
+
+def _disk(name: str, tran: str, rota: str) -> dict:
+    return {"name": name, "type": "disk", "tran": tran, "rota": rota}
+
+
+def test_select_disk_ssd_excludes_nvme():
+    # talos: type=ssd is sata/sas only - the dd target must skip the nvme and the hdd
+    disks = [_disk("nvme0n1", "nvme", "0"), _disk("sda", "sata", "0"), _disk("sdb", "sata", "1")]
+    assert remote.select_disk(InstallTarget(selector={"type": "ssd"}), disks) == "/dev/sda"
+
+
+def test_select_disk_ssd_no_match_when_only_nvme():
+    disks = [_disk("nvme0n1", "nvme", "0")]
+    with pytest.raises(remote.RemoteError, match="no disk matched"):
+        remote.select_disk(InstallTarget(selector={"type": "ssd"}), disks)
+
+
+def test_select_disk_nvme_lowest_name_wins():
+    disks = [_disk("nvme1n1", "nvme", "0"), _disk("nvme0n1", "nvme", "0")]
+    assert remote.select_disk(InstallTarget(selector={"type": "nvme"}), disks) == "/dev/nvme0n1"
+
+
+def test_select_disk_explicit_disk_short_circuits():
+    assert remote.select_disk(InstallTarget(disk="/dev/sdz"), []) == "/dev/sdz"

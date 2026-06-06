@@ -18,7 +18,7 @@ def test_roundtrip_preserves_topology(tmp_path):
     cp.nic_firmware_ext = "ghcr.io/example/fw:v1"
     worker.profile = ProfileKey.DB
     worker.install = InstallTarget(selector={"size": "<= 4TB", "type": "nvme"})
-    worker.extra_patches = ["presets/db.yaml"]
+    worker.extra_patches = ["custom-patch.yaml"]
     worker.ip, worker.gateway = "65.109.108.73", "65.108.123.1"
 
     definition.save(cluster, tmp_path)
@@ -32,7 +32,7 @@ def test_roundtrip_preserves_topology(tmp_path):
     assert lworker.profile is ProfileKey.DB
     assert lworker.install.selector == {"size": "<= 4TB", "type": "nvme"}
     assert lworker.install.disk is None
-    assert lworker.extra_patches == ["presets/db.yaml"]
+    assert lworker.extra_patches == ["custom-patch.yaml"]
 
 
 def test_definition_carries_no_progress_state(tmp_path):

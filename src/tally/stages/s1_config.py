@@ -126,6 +126,8 @@ def _machine_patch(node: Node, vswitch: Vswitch | None) -> dict:
         machine["kubelet"] = {"extraMounts": [dict(m) for m in profile.kubelet_mounts]}
     if profile.sysctls:  # merges with the common userns sysctl (talosctl unions maps)
         machine["sysctls"] = dict(profile.sysctls)
+    if profile.node_labels:
+        machine["nodeLabels"] = dict(profile.node_labels)
     if vswitch is not None:  # pin kubelet InternalIP onto the vSwitch (all roles)
         machine.setdefault("kubelet", {})["nodeIP"] = {"validSubnets": [vswitch.subnet]}
     return {"machine": machine}

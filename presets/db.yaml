@@ -1,8 +1,0 @@
-# Example EXTRA config-patch for a db node, appended after the `db` profile.
-#
-# The db profile already supplies dm_mod and the /run/topolvm kubelet mount, and
-# the install target is your per-run diskSelector answer. Use this file only for
-# what the profile does not encode. Edit freely; point a node's extra-patches at it.
-machine:
-  nodeLabels:
-    workload: db # lets CNPG / TopoLVM pods target this node via nodeSelector
