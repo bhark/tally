@@ -10,6 +10,7 @@ it out of git wherever tally runs.
 
 from __future__ import annotations
 
+import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,14 +47,21 @@ class Paths:
     def patch_discovery(self) -> Path:
         return self.defn / "patch-discovery.yaml"
 
+    # name-keyed so the removal flow can enumerate by name without a Node
+    def _patch_for(self, name: str) -> Path:
+        return self.defn / f"node-{name}-patch.yaml"
+
+    def _net_file(self, name: str) -> Path:
+        return self.defn / f"node-{name}-net.yaml"
+
     # per-node fragments, node- prefixed so they can't collide with the singular
     # fragments or role bases for any DNS-label node name
     def patch_for(self, node: Node) -> Path:
-        return self.defn / f"node-{node.name}-patch.yaml"
+        return self._patch_for(node.name)
 
     # standalone networking docs (alias/link/resolver/hostname) - see s1_config.net_docs
     def net_file(self, node: Node) -> Path:
-        return self.defn / f"node-{node.name}-net.yaml"
+        return self._net_file(node.name)
 
     # secret-bearing (secret) ----------------------------------------------
     @property
@@ -80,14 +88,46 @@ class Paths:
     def base_for(self, node: Node) -> Path:
         return self.controlplane_yaml if node.role is NodeRole.CONTROLPLANE else self.worker_yaml
 
+    def _out_dir(self, name: str) -> Path:
+        return self.secret / "_out" / name
+
+    def _config_for(self, name: str) -> Path:
+        return self.secret / f"node-{name}.yaml"
+
     def out_dir(self, node: Node) -> Path:
-        return self.secret / "_out" / node.name
+        return self._out_dir(node.name)
 
     def image(self, node: Node) -> Path:
         return self.out_dir(node) / f"{node.name}.raw.zst"
 
     def config_for(self, node: Node) -> Path:
-        return self.secret / f"node-{node.name}.yaml"
+        return self._config_for(node.name)
+
+    def node_artifacts(self, name: str) -> list[Path]:
+        """every per-node artifact path (existing or not): patch, net, config, _out/<name>."""
+        return [
+            self._patch_for(name),
+            self._net_file(name),
+            self._config_for(name),
+            self._out_dir(name),
+        ]
+
+    def purge_node(self, name: str) -> list[Path]:
+        """remove existing per-node artifacts; return those actually removed."""
+        removed: list[Path] = []
+        for p in self.node_artifacts(name):
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                elif p.exists():
+                    p.unlink()
+                else:
+                    continue
+            except OSError:
+                # _out/<name> may hold root-owned docker artifacts; same caveat as harden()
+                continue
+            removed.append(p)
+        return removed
 
     # lifecycle ------------------------------------------------------------
     def ensure(self) -> None:
