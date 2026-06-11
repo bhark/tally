@@ -18,12 +18,17 @@ from griphtui import spinner
 PROBE_TIMEOUT = 10  # per-attempt cap
 
 
-def _attempt(cmd: list[str], env: dict[str, str], timeout: int) -> bool:
+def check(cmd: list[str], env: dict[str, str], *, timeout: int = PROBE_TIMEOUT) -> bool:
+    """one-shot reachability, no spinner - safe to call from worker threads."""
     try:
         proc = subprocess.run(cmd, env=env, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0
+
+
+def _attempt(cmd: list[str], env: dict[str, str], timeout: int) -> bool:
+    return check(cmd, env, timeout=timeout)
 
 
 def _stdout(cmd: list[str], env: dict[str, str], timeout: int) -> str | None:
