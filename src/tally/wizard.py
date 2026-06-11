@@ -1,10 +1,12 @@
-"""Linear, stateless bring-up: define the cluster, then walk the runbook.
+"""Stateless reconciler driver: survey live state, show the diff, converge on demand.
 
-No progress is stored. Topology comes from tally.yaml (or operator prompts);
-idempotency comes from the workdir artifacts (secrets reused, images on disk,
-talosctl apply/helm being declarative) plus three-state probe discovery - each
-node is classified joined (skip), maintenance (apply only), or absent (image +
-rescue + apply). Adding to an already-bootstrapped cluster skips bootstrap+cilium.
+No progress is stored. Desired topology comes from tally.yaml; observed state comes from a
+live survey (observe.snapshot); every run recomputes the diff (reconcile.compute) and the
+menu renders it. "Tally Up!" walks the plan: bring up absent nodes (image + rescue + apply),
+apply to maintenance nodes, converge joined nodes (dry-run, apply only on real drift),
+bootstrap + Cilium when the live state needs them, then remove orphans (nodes live in k8s but
+absent from tally.yaml) after the new members have joined. Idempotency comes from the on-disk
+artifacts plus talosctl/helm being declarative - never from stored flags.
 """
 
 from __future__ import annotations
@@ -25,26 +27,15 @@ from griphtui import (
     warn,
 )
 
-from . import definition, disk, probe, prompts, uplink
-from .constants import (
-    DEFAULT_INSTALL_DISK,
-    VSWITCH_MTU_DEFAULT,
-    VSWITCH_SUBNET_DEFAULT,
-)
-from .model import (
-    CpuVendor,
-    InstallTarget,
-    Node,
-    NodeRole,
-    ProfileKey,
-    Stage,
-    Vswitch,
-    next_vlan_ip,
-)
+from . import definition, disk, observe, probe, prompts, removal, screens, uplink
+from .menu import Exit
+from .model import InstallTarget, Node, Stage
 from .preflight import check_tools, missing_for_stage, summary_lines
+from .reconcile import Action, ActionKind, compute
 from .runner import CommandError
 from .stages import BY_KEY, Ctx, StageCancelled, StageDef, StageError
-from .ui import gap, inventory_lines, node_line
+from .stages.s4_apply import DryRunVerdict, dry_run
+from .ui import gap, node_line
 
 _CONFIG = BY_KEY[Stage.CONFIG]
 _RESCUE = BY_KEY[Stage.RESCUE]
@@ -57,108 +48,152 @@ _WORKER_READY_TIMEOUT = 300  # worker registers + Cilium schedules → node Read
 
 
 def run(ctx: Ctx) -> None:
-    intro("Tally: Talos on Hetzner bring-up")
+    intro("Tally: Talos on Hetzner reconciler")
     _show_preflight()
-    if not _define_cluster(ctx):
-        outro("Exited before bring-up")
-        return
-    try:
-        _bring_up(ctx)
-    except StageCancelled as e:
-        warn(str(e))
-        note("Re-run with the same --dir to continue from the artifacts on disk")
-        return
-    except StageError as e:
-        error(str(e))
-        if ctx.debug:
-            note(traceback.format_exc(), title="Traceback")
-        return
-    outro("Cluster up; definition in tally.yaml, secrets in the secrets dir")
-
-
-# define --------------------------------------------------------------------
-
-
-def _define_cluster(ctx: Ctx) -> bool:
-    """Add nodes until the topology validates, then proceed. Saves tally.yaml.
-
-    Add-only: correcting or removing a node is done by hand-editing tally.yaml.
-    A defined node may already be live, so local edit/delete would drift from the
-    cluster - out of scope here.
-    """
-    cluster = ctx.cluster
+    state = screens.ScreenState(
+        ctx=ctx, snap=observe.snapshot(ctx.cluster, ctx.paths, ctx.talos_env())
+    )
     while True:
-        gap()
-        if cluster.name:
-            note(cluster.name, title="Cluster")
-        if cluster.nodes:
-            note(inventory_lines(cluster), title="Nodes")
-        else:
-            note("No nodes yet", title="Nodes")
-        problems = cluster.problems() + [p for n in cluster.nodes for p in n.problems()]
-        if problems:
-            note(problems, title="Resolve before bring-up")
-
-        options: list[Option[str]] = []
-        if not problems:
-            options.append(Option(label="Proceed with bring-up", value="__go__"))
-        if not cluster.name:
-            options.append(Option(label="Set cluster name", value="__name__"))
-        options.append(Option(label="Add a node", value="__add__"))
-        if cluster.vswitch is None:
-            options.append(Option(label="Configure vSwitch", value="__vswitch__"))
-        else:
-            vs = cluster.vswitch
-            label = f"Reconfigure vSwitch (VLAN {vs.vlan_id}, {vs.subnet})"
-            options.append(Option(label=label, value="__vswitch__"))
-            options.append(Option(label="Disable vSwitch", value="__novswitch__"))
-        options.append(Option(label="Quit", value="__quit__"))
-
-        choice = select("Define the cluster", options)
-        if is_cancel(choice) or choice == "__quit__":
-            return False
-        if choice == "__go__":
-            return True
-        if choice == "__name__":
-            _set_cluster_name(ctx)
-        if choice == "__add__":
-            _add_node(ctx)
-        if choice == "__vswitch__":
-            _configure_vswitch(ctx)
-        if choice == "__novswitch__":
-            cluster.vswitch = None
-            definition.save(cluster, ctx.paths.defn)
-            success("vSwitch disabled")
+        result = screens.main_menu(state).run()
+        if not isinstance(result, Exit):  # Back/Esc at the root ⇒ quit
+            outro("Definition saved in tally.yaml")
+            return
+        try:
+            _bring_up(ctx, state.snap)
+        except StageCancelled as e:
+            warn(str(e))
+            note("Re-run Tally Up to continue from the artifacts on disk")
+        except StageError as e:
+            error(str(e))
+            if ctx.debug:
+                note(traceback.format_exc(), title="Traceback")
+        state.snap = observe.snapshot(ctx.cluster, ctx.paths, ctx.talos_env())  # re-entry refresh
 
 
 # bring-up ------------------------------------------------------------------
 
 
-def _bring_up(ctx: Ctx) -> None:
-    _run_phase(ctx, _CONFIG, None)  # regen all per-node configs (idempotent)
-    cp = ctx.cluster.bootstrap_cp
-    rest = [n for n in ctx.cluster.nodes if n is not cp]
-    # kubeconfig present ⇒ already bootstrapped → join-only walk, secure probe enabled
+def _bring_up(ctx: Ctx, snap: observe.Snapshot) -> None:
     cluster_up = ctx.paths.kubeconfig.exists()
-    for node in [cp, *rest]:  # bootstrap_cp first so BOOTSTRAP targets a live CP
-        _bring_up_node(ctx, node, cluster_up=cluster_up)
+    plan = compute(ctx.cluster, snap, cluster_up=cluster_up)
+    _run_phase(ctx, _CONFIG, None)  # regen all per-node configs (idempotent)
 
-    if not cluster_up:
+    for action in plan.actions:
+        if action.kind is not ActionKind.REMOVE:
+            _run_node_action(ctx, action)
+
+    if plan.bootstrap:
         gap()
         if prompts.ask("Bootstrap etcd now? once per cluster", default=True):
             _run_phase(ctx, _BOOTSTRAP, None)
         else:
             note("Skipped bootstrap")
 
-    # gate on actual CNI presence, not cluster_up: a run that bootstrapped then died at
-    # cilium must still install on rerun (helm upgrade --install makes it safe)
     gap()
-    if _cilium_installed(ctx):
-        note("Cilium already installed → skipping")
-    else:
+    if plan.cilium:
         _run_phase(ctx, _CILIUM, None)
+    else:
+        note("Cilium already installed → skipping")
+
+    # removals trail bootstrap+cilium so new members join etcd before old ones leave
+    removals = [a for a in plan.actions if a.kind is ActionKind.REMOVE]
+    if removals:
+        _remove_orphans(ctx, removals)
 
     _verify_workers_ready(ctx)
+
+
+def _run_node_action(ctx: Ctx, action: Action) -> None:
+    node = action.node
+    assert node is not None
+    gap()
+    note(node_line(node), title=f"{action.kind}: {node.name}")
+    if action.kind is ActionKind.BRING_UP:  # absent: image + rescue + apply
+        _run_phase(ctx, _RESCUE, node)  # builds the image post-pin; ends reachable in maintenance
+        _pin_and_render(ctx, node)
+        _apply_and_verify(ctx, node)
+    elif action.kind is ActionKind.APPLY:  # maintenance: pin + apply
+        _pin_and_render(ctx, node)
+        _apply_and_verify(ctx, node)
+    elif action.kind is ActionKind.REAPPLY:  # configured pre-bootstrap: re-apply to converge drift
+        _apply_and_verify(ctx, node)
+    elif action.kind is ActionKind.CONVERGE:  # joined member of an up cluster
+        _converge(ctx, node)
+
+
+def _converge(ctx: Ctx, node: Node) -> None:
+    """Joined node: dry-run, apply only on real drift, confirm a reboot.
+
+    No pin/rescue - the maintenance API is gone, the rendered config already carries the
+    persisted link_mac, and config just regenerated. A reboot-requiring apply is the
+    operator's call; a no-reboot apply lands silently.
+    """
+    if not node.ip or not ctx.paths.talosconfig.exists() or shutil.which("talosctl") is None:
+        return
+    verdict, diff = dry_run(ctx, node)
+    if verdict is DryRunVerdict.IN_SYNC:
+        note(f"{node.name} in sync → skipping")
+        return
+    if verdict is DryRunVerdict.NO_REBOOT:
+        _run_phase(ctx, _APPLY, node)
+        success(f"{node.name} converged (no reboot)")
+        return
+    if diff:
+        note(diff, title=f"{node.name} config diff")
+    if prompts.ask(f"Apply to {node.name} with a reboot?", default=False):
+        _apply_and_verify(ctx, node)
+    else:
+        warn(f"{node.name} apply skipped - node remains drifted")
+
+
+def _remove_orphans(ctx: Ctx, removals: list[Action]) -> None:
+    missing = missing_for_stage(Stage.REMOVE)
+    if missing:
+        warn(f"Skipping orphan removal: missing tools ({', '.join(missing)})")
+        return
+    env = ctx.talos_env()
+    orphans = [a.orphan for a in removals if a.orphan is not None]
+    removal.repoint_endpoints(ctx.cluster, env)  # operator hop, off any orphan endpoint
+    removal.protect_kubeconfig(ctx.cluster, ctx.paths, orphans)
+    for action in removals:
+        gap()
+        _confirm_and_remove(ctx, action, env)
+
+
+def _confirm_and_remove(ctx: Ctx, action: Action, env: dict[str, str]) -> None:
+    orphan = action.orphan
+    assert orphan is not None
+    addrs = ", ".join(orphan.addresses) or "no known address"
+    role = "control-plane" if orphan.control_plane else "worker"
+    note(f"{orphan.name}  {role}  {addrs}", title="Orphan (live, not in tally.yaml)")
+    if action.hint and action.hint.startswith("refusing"):
+        warn(action.hint)
+        return
+    if action.hint:
+        warn(action.hint)
+    if not prompts.ask(f"Remove orphan {orphan.name} from the cluster?", default=False):
+        note(f"Keeping {orphan.name}")
+        return
+    wipe_all = _ask_wipe_scope()
+    if wipe_all is None:
+        note(f"Removal of {orphan.name} aborted")
+        return
+    removal.remove_orphan(ctx.cluster, ctx.paths, env, orphan, wipe_all=wipe_all)
+
+
+def _ask_wipe_scope() -> bool | None:
+    """True ⇒ wipe data disks too; None ⇒ operator backed out. Always explicit - reset's own
+    default wipes everything, so the choice is never inferred."""
+    choice = select(
+        "Wipe scope for the removed node",
+        [
+            Option(label="System disk only (keep data disks)", value="system"),
+            Option(label="Full wipe including data disks", value="all"),
+        ],
+    )
+    if is_cancel(choice):
+        return None
+    return choice == "all"
 
 
 def _verify_workers_ready(ctx: Ctx) -> None:
@@ -191,47 +226,6 @@ def _verify_workers_ready(ctx: Ctx) -> None:
                 f"(trustd/apid join or CNI failure) - check the node console"
             )
         success(f"worker {node.name} joined and Ready")
-
-
-def _cilium_installed(ctx: Ctx) -> bool:
-    if not ctx.paths.kubeconfig.exists() or shutil.which("kubectl") is None:
-        return False
-    return probe.reachable(
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(ctx.paths.kubeconfig),
-            "get",
-            "ds",
-            "-n",
-            "kube-system",
-            "cilium",
-        ],
-        ctx.talos_env(),
-        "Checking whether Cilium is installed",
-    )
-
-
-def _bring_up_node(ctx: Ctx, node: Node, *, cluster_up: bool) -> None:
-    gap()
-    note(node_line(node), title=f"Bring up {node.name}")
-
-    if _in_maintenance(ctx, node):
-        note(f"{node.name} in maintenance → applying config")
-        _pin_and_render(ctx, node)
-        _apply_and_verify(ctx, node)
-        return
-    if _configured(ctx, node):  # answers mTLS ⇒ already carries our config
-        if cluster_up:  # live member of an up cluster - leave it untouched
-            note(f"{node.name} already joined ({node.ip}) → skipping")
-        else:  # configured but pre-bootstrap → re-apply to converge config drift
-            note(f"{node.name} already configured ({node.ip}) → re-applying config")
-            _apply_and_verify(ctx, node)
-        return
-
-    _run_phase(ctx, _RESCUE, node)  # builds the image post-pin; ends reachable in maintenance
-    _pin_and_render(ctx, node)
-    _apply_and_verify(ctx, node)
 
 
 def _apply_and_verify(ctx: Ctx, node: Node) -> None:
@@ -303,134 +297,6 @@ def _run_phase(ctx: Ctx, sd: StageDef, node: Node | None) -> None:
             note(e.stderr_tail, title="Last output")
         raise StageCancelled(f"{label} failed") from e
     success(f"{label} complete")
-
-
-def _in_maintenance(ctx: Ctx, node: Node) -> bool:
-    """Insecure probe: the Talos API answers unauthenticated only in maintenance mode.
-
-    True ⇒ imaged but not yet applied. Bounded; a no-answer falls back to guided rescue.
-    """
-    if not node.ip or shutil.which("talosctl") is None:
-        return False
-    return probe.reachable(
-        ["talosctl", "-n", node.ip, "get", "disks", "--insecure"],
-        ctx.talos_env(),
-        f"Probing {node.name} ({node.ip})",
-    )
-
-
-def _configured(ctx: Ctx, node: Node) -> bool:
-    """Secure mTLS probe: only a node already carrying our config answers with the client cert.
-
-    True regardless of whether the cluster is bootstrapped - a maintenance or absent node
-    fails the same way (no mTLS). The caller uses cluster_up to tell a live member (skip)
-    from a configured-but-pre-bootstrap node (re-apply). Needs the generated talosconfig.
-    """
-    if not node.ip or shutil.which("talosctl") is None:
-        return False
-    if not ctx.paths.talosconfig.exists():
-        return False
-    return probe.reachable(
-        ["talosctl", "-e", node.ip, "-n", node.ip, "version"],
-        ctx.talos_env(),
-        f"Checking whether {node.name} ({node.ip}) already has config",
-    )
-
-
-# cluster prompts -----------------------------------------------------------
-
-
-def _configure_vswitch(ctx: Ctx) -> None:
-    """Prompt VLAN ID + subnet (MTU defaulted to the Hetzner cap), persist tally.yaml."""
-    cluster = ctx.cluster
-    current = cluster.vswitch
-    vlan = prompts.ask_text(
-        "vSwitch VLAN ID",
-        default=str(current.vlan_id) if current else "",
-        validate=prompts.vlan_id_validator,
-    )
-    if vlan is None:
-        return
-    subnet = prompts.ask_text(
-        "vSwitch subnet (CIDR, pick whatever you like)",
-        default=current.subnet if current else VSWITCH_SUBNET_DEFAULT,
-        validate=prompts.cidr_validator,
-    )
-    if subnet is None:
-        return
-    cluster.vswitch = Vswitch(vlan_id=int(vlan), subnet=subnet, mtu=VSWITCH_MTU_DEFAULT)
-    definition.save(cluster, ctx.paths.defn)
-    success(f"vSwitch configured: VLAN {vlan}, {subnet}")
-
-
-def _set_cluster_name(ctx: Ctx) -> None:
-    """Prompt the cluster name once; baked into gen config, so fix later by hand-editing."""
-    cluster = ctx.cluster
-    name = prompts.ask_text("Cluster name", validate=prompts.cluster_name_validator)
-    if name is None:
-        return
-    cluster.name = name
-    definition.save(cluster, ctx.paths.defn)
-    success(f"Cluster name set to {name!r}")
-
-
-# node prompts --------------------------------------------------------------
-
-
-def _add_node(ctx: Ctx) -> None:
-    """Prompt a full node (role first), append on success. Any cancel aborts cleanly."""
-    cluster = ctx.cluster
-    role = prompts.ask_role()
-    if role is None:
-        return
-    label = "control-plane" if role is NodeRole.CONTROLPLANE else "worker"
-    name = prompts.ask_text(f"{label.capitalize()} name", validate=prompts.name_validator(cluster))
-    if name is None:
-        return
-    cpu = prompts.ask_cpu(CpuVendor.AMD)
-    if cpu is None:
-        return
-    profile = prompts.ask_profile(ProfileKey.GENERIC)
-    if profile is None:
-        return
-    ip = prompts.ask_text("IPv4 address", validate=prompts.ipv4_validator)
-    if ip is None:
-        return
-    gateway = prompts.ask_text("Gateway", validate=prompts.ipv4_validator)
-    if gateway is None:
-        return
-    vlan_ip = ""
-    if cluster.vswitch is not None:  # auto-assigned, not prompted: CP from .1, worker from .100
-        vlan_ip = next_vlan_ip(cluster, role)
-        if vlan_ip is None:
-            error(f"No free vSwitch IP for a {label} in {cluster.vswitch.subnet}")
-            return
-        note(f"vSwitch IP auto-assigned: {vlan_ip}")
-    install = prompts.ask_install_target(InstallTarget(disk=DEFAULT_INSTALL_DISK), profile)
-    if install is None:
-        return
-    fw = prompts.ask_text("Extra NIC firmware extension ref (blank if none)", default="")
-    if fw is None:
-        return
-    extra = prompts.ask_extra_patches([])
-    if extra is None:
-        return
-    cluster.nodes.append(
-        Node(
-            name=name,
-            role=role,
-            cpu=cpu,
-            profile=profile,
-            ip=ip,
-            gateway=gateway,
-            vlan_ip=vlan_ip,
-            install=install,
-            nic_firmware_ext=fw or None,
-            extra_patches=extra,
-        )
-    )
-    definition.save(cluster, ctx.paths.defn)
-    success(f"Added {label} {name}")
 
 
 # small helpers -------------------------------------------------------------

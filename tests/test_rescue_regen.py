@@ -5,6 +5,7 @@ import pytest
 from tally import wizard
 from tally.model import InstallTarget, default_cluster
 from tally.paths import Paths
+from tally.reconcile import Action, ActionKind
 from tally.stages import Ctx, s3_rescue
 
 
@@ -97,7 +98,7 @@ def test_s3_unchanged_mac_reuses_image(tmp_path, monkeypatch):
 
 
 def _driver(tmp_path, monkeypatch, selector, mac=None):
-    """Single-node bring-up with the live pin resolvers stubbed to `selector` / `mac`."""
+    """Single-node action with the live pin resolvers stubbed to `selector` / `mac`."""
     ctx = _ctx(tmp_path)
     ctx.cluster.nodes = ctx.cluster.nodes[:1]
     node = ctx.cluster.nodes[0]
@@ -105,8 +106,6 @@ def _driver(tmp_path, monkeypatch, selector, mac=None):
     calls: list[str] = []
 
     monkeypatch.setattr(wizard, "_run_phase", lambda ctx, sd, node: calls.append(sd.key.value))
-    monkeypatch.setattr(wizard, "_configured", lambda ctx, node: False)
-    monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: False)
     monkeypatch.setattr(wizard.disk, "resolve_system_selector", lambda ip, env: selector)
     monkeypatch.setattr(wizard.uplink, "resolve_uplink_mac", lambda ip, env: mac)
     return ctx, node, calls
@@ -115,7 +114,7 @@ def _driver(tmp_path, monkeypatch, selector, mac=None):
 def test_driver_pins_boot_disk_and_regens(tmp_path, monkeypatch):
     ctx, node, calls = _driver(tmp_path, monkeypatch, {"wwid": "eui.0a"})
 
-    wizard._bring_up_node(ctx, node, cluster_up=False)
+    wizard._run_node_action(ctx, Action(ActionKind.BRING_UP, node=node))
 
     assert calls == ["rescue", "config", "apply"]  # pin re-renders post-rescue
     assert node.resolved_install.selector == {"wwid": "eui.0a"}
@@ -125,7 +124,7 @@ def test_driver_pins_boot_disk_and_regens(tmp_path, monkeypatch):
 def test_driver_unresolved_pins_skip_regen(tmp_path, monkeypatch):
     ctx, node, calls = _driver(tmp_path, monkeypatch, None)  # no clean signal
 
-    wizard._bring_up_node(ctx, node, cluster_up=False)
+    wizard._run_node_action(ctx, Action(ActionKind.BRING_UP, node=node))
 
     assert calls == ["rescue", "apply"]  # nothing to re-render
     assert node.resolved_install is None  # falls back to declarative selector
@@ -133,9 +132,8 @@ def test_driver_unresolved_pins_skip_regen(tmp_path, monkeypatch):
 
 def test_driver_maintenance_node_pins_before_apply(tmp_path, monkeypatch):
     ctx, node, calls = _driver(tmp_path, monkeypatch, {"serial": "S1"})
-    monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: True)  # imaged out-of-band
 
-    wizard._bring_up_node(ctx, node, cluster_up=False)
+    wizard._run_node_action(ctx, Action(ActionKind.APPLY, node=node))
 
     assert calls == ["config", "apply"]  # no rescue, but still pin + re-render
     assert node.resolved_install.selector == {"serial": "S1"}
@@ -144,9 +142,8 @@ def test_driver_maintenance_node_pins_before_apply(tmp_path, monkeypatch):
 def test_driver_maintenance_node_pins_uplink_mac(tmp_path, monkeypatch):
     """A maintenance-path node (imaged out-of-band) still gets its alias pinned + persisted."""
     ctx, node, calls = _driver(tmp_path, monkeypatch, None, mac="9c:6b:00:e7:84:16")
-    monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: True)
 
-    wizard._bring_up_node(ctx, node, cluster_up=False)
+    wizard._run_node_action(ctx, Action(ActionKind.APPLY, node=node))
 
     assert calls == ["config", "apply"]  # mac pin alone re-renders
     assert node.link_mac == "9c:6b:00:e7:84:16"
