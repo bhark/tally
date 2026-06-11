@@ -3,7 +3,8 @@
 The operator activates Hetzner rescue and resets the box themselves (Robot UI), then
 confirms here; tally polls until rescue ssh answers, opens an ssh master connection,
 verifies it's a rescue ramdisk (not the installed OS), then drives the write: probe the
-target disk, upload the image, wipe every disk, dd the image, reboot. ssh handles auth.
+target disk, upload the image, wipe every disk, dd the image, register the UEFI boot
+entry, reboot. ssh handles auth.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from ..model import Node, Stage
 from ..ui import gap
 from .base import Ctx, StageCancelled, StageDef
 
-_BOOT_TIMEOUT = 300  # bare-metal POST + fresh-disk boot; match the apply-reboot budget
+_BOOT_TIMEOUT = 900  # some firmware walks every network-boot option before the disk entry
 _SSH_PORT = 22
 _RESCUE_TIMEOUT = 300  # rescue ramdisk boot can lag well behind the operator's confirm
 
@@ -116,6 +117,10 @@ def _resolve_disk(session: remote.Session, node: Node) -> str:
 def _write_script(image: str, disk: str) -> str:
     # wipe EVERY disk first so no stale OS wins the boot order; pipefail makes a failed
     # zstd|dd abort the script (and surface) rather than silently leaving a half-written disk
+    #
+    # the NVRAM entry is required, not a nicety: UEFI only mandates the \EFI\BOOT fallback
+    # for removable media, and some firmware never tries it on fixed disks. appended LAST in
+    # BootOrder so Hetzner's network-boot interception (rescue activation) still wins.
     return f"""set -eo pipefail
 mdadm --stop --scan 2>/dev/null || true
 for d in /dev/nvme[0-9]n[0-9] /dev/sd[a-z]; do
@@ -125,7 +130,15 @@ for d in /dev/nvme[0-9]n[0-9] /dev/sd[a-z]; do
   blkdiscard -f "$d" 2>/dev/null || dd if=/dev/zero of="$d" bs=1M count=64 oflag=direct
 done
 zstd -d -c {image} | dd of={disk} bs=4M iflag=fullblock status=progress oflag=direct
-sync"""
+sync
+if [ -d /sys/firmware/efi ]; then
+  partprobe {disk} 2>/dev/null || true
+  for b in $(efibootmgr | grep ' talos' | cut -c5-8); do efibootmgr -q -b "$b" -B; done
+  order=$(efibootmgr | grep '^BootOrder:' | cut -d' ' -f2 || true)
+  efibootmgr -q -c -d {disk} -p 1 -L talos -l '\\EFI\\BOOT\\BOOTX64.EFI'
+  new=$(efibootmgr | grep ' talos' | cut -c5-8 | head -1)
+  if [ -n "$order" ] && [ -n "$new" ]; then efibootmgr -q -o "$order,$new"; fi
+fi"""
 
 
 def _await_talos(ctx: Ctx, node: Node) -> None:

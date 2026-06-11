@@ -64,7 +64,7 @@ _APPLY = BY_KEY[Stage.APPLY]
 _BOOTSTRAP = BY_KEY[Stage.BOOTSTRAP]
 _CILIUM = BY_KEY[Stage.CILIUM]
 
-_APPLY_VERIFY_TIMEOUT = 300  # apply → install to disk → reboot → secure API; generous
+_APPLY_VERIFY_TIMEOUT = 900  # apply → install → reboot → secure API; firmware may walk PXE first
 _WORKER_READY_TIMEOUT = 300  # worker registers + Cilium schedules → node Ready
 
 
@@ -260,11 +260,20 @@ def _apply_and_verify(ctx: Ctx, node: Node) -> None:
         return  # pre-config / unvalidated node (tests); nothing to verify against yet
     cmd = ["talosctl", "-e", node.ip, "-n", node.ip, "version"]
     label = f"Waiting for {node.name} to reboot into config (≤{_APPLY_VERIFY_TIMEOUT // 60}m)"
-    if not probe.wait_until(cmd, ctx.talos_env(), label, timeout=_APPLY_VERIFY_TIMEOUT):
-        raise StageError(
-            f"{node.name} did not answer the secure Talos API after apply "
-            f"(apid/trustd or install/boot failure) - check the node console"
+    while not probe.wait_until(cmd, ctx.talos_env(), label, timeout=_APPLY_VERIFY_TIMEOUT):
+        gap()
+        choice = select(
+            f"{node.name} not back on the secure API after {_APPLY_VERIFY_TIMEOUT // 60}m",
+            [
+                Option(label="Keep waiting", value="wait"),
+                Option(label="Abort", value="abort"),
+            ],
         )
+        if is_cancel(choice) or choice == "abort":
+            raise StageError(
+                f"{node.name} did not answer the secure Talos API after apply "
+                f"(apid/trustd or install/boot failure) - check the node console"
+            )
     success(f"{node.name} rebooted into configured Talos")
 
 
