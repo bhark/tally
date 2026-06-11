@@ -16,24 +16,26 @@ _SYNC_TIMEOUT = 150  # first NTP sync on a freshly-booted bare-metal CP; generou
 def run_bootstrap(ctx: Ctx, _node: Node | None) -> None:
     cp = ctx.cluster.bootstrap_cp
     cp_ips = [n.ip for n in ctx.cluster.control_planes]
+    # rpcs relay via an arbitrary cp endpoint; hetzner firewalls inter-node public
+    # :50000, so the relay's dial must ride the vswitch when there is one
+    node_ip = cp.vlan_ip if ctx.cluster.vswitch else cp.ip
     env = ctx.talos_env()
     paths = ctx.paths
 
-    # endpoints span every CP (KubePrism gives in-cluster HA); node = bootstrap CP
-    # talosctl config endpoint/node stay on public CP IPs (operator talosctl uses 50000 publicly)
+    # endpoints stay public CP IPs - the operator hop (admin → :50000 is firewall-allowed)
     run(["talosctl", "config", "endpoint", *cp_ips], label="Set talosconfig endpoints", env=env)
-    run(["talosctl", "config", "node", cp.ip], label="Set talosconfig node", env=env)
+    run(["talosctl", "config", "node", node_ip], label="Set talosconfig node", env=env)
 
     # etcd answers member list only once bootstrapped; skip re-bootstrap on resume
     already = probe.reachable(
-        ["talosctl", "-n", cp.ip, "etcd", "members"],
+        ["talosctl", "-n", node_ip, "etcd", "members"],
         env,
         f"Checking whether {cp.name} etcd is already bootstrapped",
     )
     if already:
         note(f"{cp.name} etcd already bootstrapped → skipping bootstrap")
     else:
-        _await_timesync(ctx, cp)
+        _await_timesync(ctx, cp, node_ip)
         run(["talosctl", "bootstrap"], label="Bootstrap etcd (once)", env=env)
 
     run(["talosctl", "kubeconfig", str(paths.secret)], label="Fetch kubeconfig", env=env)
@@ -61,14 +63,14 @@ def _rewrite_kubeconfig_server(ctx: Ctx, cp: Node) -> None:
     note(f"Rewrote kubeconfig server {private} → {public}")
 
 
-def _await_timesync(ctx: Ctx, cp: Node) -> None:
+def _await_timesync(ctx: Ctx, cp: Node, node_ip: str) -> None:
     """etcd refuses to bootstrap until the CP clock is NTP-synced (FailedPrecondition).
 
     The operator confirms the moment they can, but a freshly-booted node may not have
     finished its first SNTP sync - so spin on TimeStatus.synced rather than letting
     bootstrap fail and forcing a manual retry.
     """
-    cmd = ["talosctl", "-n", cp.ip, "get", "timestatus", "-o", "jsonpath={.spec.synced}"]
+    cmd = ["talosctl", "-n", node_ip, "get", "timestatus", "-o", "jsonpath={.spec.synced}"]
     label = f"Waiting for {cp.name} clock to NTP-sync (≤{_SYNC_TIMEOUT // 60}m)"
     if probe.wait_for_value(cmd, ctx.talos_env(), label, "true", timeout=_SYNC_TIMEOUT):
         note(f"{cp.name} clock synced → bootstrapping etcd")
