@@ -7,10 +7,37 @@ The reachability probe doubles as the mode selector.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from .. import probe
 from ..model import Node, Stage
 from ..runner import run
 from .base import Ctx, StageDef, StageError
+
+
+class DryRunVerdict(StrEnum):
+    IN_SYNC = "in-sync"
+    NO_REBOOT = "no-reboot"
+    REBOOT = "reboot"
+
+
+def parse_dry_run(stderr: str) -> DryRunVerdict:
+    # talosctl prints the summary to stderr; order matters, "No changes." wins
+    if "No changes." in stderr:
+        return DryRunVerdict.IN_SYNC
+    if "without a reboot" in stderr:
+        return DryRunVerdict.NO_REBOOT
+    if "with a reboot" in stderr:
+        return DryRunVerdict.REBOOT
+    return DryRunVerdict.REBOOT  # unknown output forces an operator confirm
+
+
+def dry_run(ctx: Ctx, node: Node) -> tuple[DryRunVerdict, str]:
+    """(verdict, diff/summary text); secure --dry-run, never reboots."""
+    config = ctx.paths.config_for(node)
+    cmd = ["talosctl", "apply-config", "--dry-run", "-e", node.ip, "-n", node.ip, "-f", str(config)]
+    result = run(cmd, label=f"Dry-run config for {node.name}", env=ctx.talos_env(), check=False)
+    return parse_dry_run(result.stderr), result.stderr.strip()
 
 
 def run_apply(ctx: Ctx, node: Node | None) -> None:
