@@ -1,22 +1,27 @@
-"""Stage 3 - rescue + write image.
+"""Stage 3 - rescue + build/write image.
 
 The operator activates Hetzner rescue and resets the box themselves (Robot UI), then
 confirms here; tally polls until rescue ssh answers, opens an ssh master connection,
-verifies it's a rescue ramdisk (not the installed OS), then drives the write: probe the
-target disk, upload the image, wipe every disk, dd the image, register the UEFI boot
-entry, reboot. ssh handles auth.
+verifies it's a rescue ramdisk (not the installed OS), then drives the write: pin the
+uplink MAC, (re)build the image, probe the target disk, upload, wipe every disk, dd the
+image, register the UEFI boot entry, reboot. ssh handles auth.
+
+The image is built here, not as a standalone earlier step: its embedded net docs depend
+on the uplink MAC, a hardware fact first knowable over this very ssh session.
 """
 
 from __future__ import annotations
 
 import shutil
 
-from griphtui import Option, confirm, error, is_cancel, note, select, text
+from griphtui import Option, confirm, error, is_cancel, note, select, text, warn
 
-from .. import probe, remote
+from .. import definition, probe, remote
 from ..model import Node, Stage
 from ..ui import gap
 from .base import Ctx, StageCancelled, StageDef
+from .s1_config import render_node
+from .s2_image import run_image
 
 _BOOT_TIMEOUT = 900  # some firmware walks every network-boot option before the disk entry
 _SSH_PORT = 22
@@ -38,10 +43,6 @@ def _nonempty(label: str):
 
 def run_rescue(ctx: Ctx, node: Node | None) -> None:
     assert node is not None
-    image = ctx.paths.image(node)
-    if not image.exists():
-        raise StageCancelled(f"{image.name} missing; build the image first")
-
     note(
         [
             "In the Hetzner Robot panel for this server:",
@@ -62,6 +63,7 @@ def run_rescue(ctx: Ctx, node: Node | None) -> None:
             remote.verify_rescue(session)
         except remote.RemoteError as e:
             raise StageCancelled(str(e)) from e
+        _ensure_image(ctx, node, rebuild=_pin_uplink(ctx, node, session))
         disk = _resolve_disk(session, node)
         gap()
         if not _require(
@@ -75,13 +77,38 @@ def run_rescue(ctx: Ctx, node: Node | None) -> None:
             ).strip()
 
         remote_image = f"/tmp/{node.name}.raw.zst"
-        remote.upload(session, str(image), remote_image, f"Uploading image to {node.name}")
+        remote.upload(
+            session, str(ctx.paths.image(node)), remote_image, f"Uploading image to {node.name}"
+        )
         remote.exec(session, _write_script(remote_image, disk), f"Writing image to {disk}")
         remote.exec(session, "reboot", f"Rebooting {node.name}", check=False)
     finally:
         remote.disconnect(session)
 
     _await_talos(ctx, node)
+
+
+def _pin_uplink(ctx: Ctx, node: Node, session: remote.Session) -> bool:
+    """Pin the link alias to the rescue uplink's MAC. True ⇒ pin changed (image is stale)."""
+    mac = remote.uplink_mac(session)
+    if not mac:
+        warn(f"{node.name}: uplink MAC unresolved; keeping structural link match")
+        return False
+    if mac == node.link_mac:
+        return False
+    node.link_mac = mac
+    definition.save(ctx.cluster, ctx.paths.defn)
+    note(f"{node.name}: link alias pinned to uplink mac {mac}")
+    return True
+
+
+def _ensure_image(ctx: Ctx, node: Node, *, rebuild: bool) -> None:
+    image = ctx.paths.image(node)
+    if image.exists() and not rebuild:
+        note(f"Reusing existing image {image.name}")
+        return
+    render_node(ctx, node)  # net docs must embed the pin before the imager snapshots them
+    run_image(ctx, node)
 
 
 def _open(node: Node) -> remote.Session:

@@ -38,6 +38,8 @@ class Stage(StrEnum):
 _IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 # Talos requires node names to be valid hostnames; the node- artifact prefix relies on it
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+# normalized form only; discovery lowercases before storing
+_MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 # field-based install.diskSelector type values verified against Talos release-1.13
 SELECTOR_TYPES = frozenset({"ssd", "hdd", "nvme", "sd"})
@@ -51,6 +53,10 @@ def is_ipv4(value: str) -> bool:
 
 def is_dns_label(value: str) -> bool:
     return bool(_DNS_LABEL_RE.match(value))
+
+
+def is_mac(value: str) -> bool:
+    return bool(_MAC_RE.match(value))
 
 
 def is_host_in_subnet(ip: str, subnet: str) -> bool:
@@ -145,6 +151,9 @@ class Node:
     gateway: str = ""
     vlan_ip: str = ""  # private vSwitch address; unused (and ignored) when no vswitch
     install: InstallTarget = field(default_factory=_default_install)
+    # uplink NIC MAC, auto-discovered (rescue ssh / maintenance API), never operator-typed;
+    # pins the link alias on multi-NIC boxes where structural match would be ambiguous
+    link_mac: str = ""
     nic_firmware_ext: str | None = None
     extra_patches: list[str] = field(default_factory=list)  # operator --config-patch files
     # transient: install pinned to the live boot disk; rendered into config, never
@@ -158,6 +167,8 @@ class Node:
             out.append(f"{self.name}: IPv4 address missing or malformed")
         if not is_ipv4(self.gateway):
             out.append(f"{self.name}: gateway missing or malformed")
+        if self.link_mac and not is_mac(self.link_mac):
+            out.append(f"{self.name}: link_mac must be a lowercase colon-separated MAC")
         out += self.install.problems(self.name)
         return out
 

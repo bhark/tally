@@ -16,6 +16,7 @@ def test_roundtrip_preserves_topology(tmp_path):
     cp.cpu = CpuVendor.INTEL
     cp.ip, cp.gateway = "65.109.108.72", "65.108.123.1"
     cp.nic_firmware_ext = "ghcr.io/example/fw:v1"
+    cp.link_mac = "9c:6b:00:e7:84:16"
     worker.profile = ProfileKey.DB
     worker.install = InstallTarget(selector={"size": "<= 4TB", "type": "nvme"})
     worker.extra_patches = ["custom-patch.yaml"]
@@ -29,6 +30,8 @@ def test_roundtrip_preserves_topology(tmp_path):
     assert lcp.role is NodeRole.CONTROLPLANE and lcp.cpu is CpuVendor.INTEL
     assert lcp.ip == "65.109.108.72"
     assert lcp.nic_firmware_ext == "ghcr.io/example/fw:v1"
+    assert lcp.link_mac == "9c:6b:00:e7:84:16"
+    assert lworker.link_mac == ""
     assert lworker.profile is ProfileKey.DB
     assert lworker.install.selector == {"size": "<= 4TB", "type": "nvme"}
     assert lworker.install.disk is None

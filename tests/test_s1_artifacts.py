@@ -113,6 +113,25 @@ def test_config_artifacts(tmp_path, monkeypatch):
         assert paths.config_for(node).exists()
 
 
+def test_link_alias_pinned_to_uplink_mac(tmp_path, monkeypatch):
+    """A discovered uplink MAC pins the alias; unpinned nodes keep the structural match."""
+    paths = _paths(tmp_path)
+    cluster = _ready_cluster()
+    cp, worker = cluster.nodes
+    cp.link_mac = "9c:6b:00:e7:84:16"
+
+    run, _calls = _fake_run(paths)
+    monkeypatch.setattr(s1_config, "run", run)
+    s1_config.run_config(Ctx(cluster=cluster, paths=paths), None)
+
+    cp_net = {d["kind"]: d for d in yaml.safe_load_all(paths.net_file(cp).read_text())}
+    match = cp_net["LinkAliasConfig"]["selector"]["match"]
+    assert match == 'mac(link.permanent_addr) == "9c:6b:00:e7:84:16"'
+
+    worker_net = {d["kind"]: d for d in yaml.safe_load_all(paths.net_file(worker).read_text())}
+    assert worker_net["LinkAliasConfig"]["selector"]["match"] is True
+
+
 def test_resolved_install_overrides_declarative_in_render(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     cluster = _ready_cluster()

@@ -60,10 +60,8 @@ def test_fresh_cluster_full_walk_then_bootstrap_and_cilium(tmp_path, monkeypatch
     wizard._bring_up(_ctx(tmp_path))  # no kubeconfig → fresh
     assert seq == [
         ("config", None),
-        ("image", "cp1"),
-        ("rescue", "cp1"),
+        ("rescue", "cp1"),  # image builds inside rescue, post uplink pin
         ("apply", "cp1"),
-        ("image", "worker1"),
         ("rescue", "worker1"),
         ("apply", "worker1"),
         ("bootstrap", None),
@@ -83,12 +81,11 @@ def test_existing_cluster_skips_joined_nodes_and_bootstrap(tmp_path, monkeypatch
 
     wizard._bring_up(ctx)
 
-    assert ("apply", "cp1") not in seq and ("image", "cp1") not in seq  # joined → untouched
+    assert ("apply", "cp1") not in seq and ("rescue", "cp1") not in seq  # joined → untouched
     keys = [k for k, _ in seq]
     assert "bootstrap" not in keys and "cilium" not in keys
     assert seq == [
         ("config", None),
-        ("image", "worker1"),
         ("rescue", "worker1"),
         ("apply", "worker1"),
     ]

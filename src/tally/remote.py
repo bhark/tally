@@ -18,7 +18,7 @@ import tempfile
 from dataclasses import dataclass
 
 from . import runner
-from .model import InstallTarget
+from .model import InstallTarget, is_mac
 from .runner import CommandResult
 
 _CONNECT_TIMEOUT = 10
@@ -125,6 +125,17 @@ def verify_rescue(session: Session) -> None:
     res = exec(session, "lsblk -Jo NAME,MOUNTPOINT", f"Verifying rescue mode on {session.host}")
     if _root_mounted(json.loads(res.out).get("blockdevices", [])):
         raise RemoteError(f"root is mounted from a disk on {session.host} - not a rescue ramdisk")
+
+
+def uplink_mac(session: Session) -> str | None:
+    """MAC of the interface carrying the rescue default route - the box's one real uplink."""
+    cmd = (
+        "ip route get 1.1.1.1 | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -1 "
+        "| xargs -rI{} cat /sys/class/net/{}/address"
+    )
+    res = exec(session, cmd, f"Reading uplink MAC on {session.host}", check=False)
+    mac = res.out.lower()
+    return mac if is_mac(mac) else None
 
 
 def _is_rotational(row: dict) -> bool:

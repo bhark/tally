@@ -17,7 +17,7 @@ from .model import Stage
 STAGE_TOOLS: dict[Stage, tuple[str, ...]] = {
     Stage.CONFIG: ("talosctl",),
     Stage.IMAGE: ("docker", "crane"),
-    Stage.RESCUE: (),
+    Stage.RESCUE: ("docker", "crane"),  # image is (re)built mid-rescue, post uplink pin
     Stage.APPLY: ("talosctl",),
     Stage.BOOTSTRAP: ("talosctl",),
     Stage.CILIUM: ("helm", "kubectl"),

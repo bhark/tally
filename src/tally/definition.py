@@ -61,6 +61,7 @@ def _node_to_dict(node: Node) -> dict:
         "gateway": node.gateway,
         "vlan_ip": node.vlan_ip,
         "install": _install_to_dict(node.install),
+        "link_mac": node.link_mac,
         "nic_firmware_ext": node.nic_firmware_ext,
         "extra_patches": list(node.extra_patches),
     }
@@ -76,6 +77,7 @@ def _node_from_dict(raw: dict) -> Node:
         gateway=raw.get("gateway", ""),
         vlan_ip=raw.get("vlan_ip", ""),
         install=_install_from_dict(raw.get("install")),
+        link_mac=raw.get("link_mac", ""),
         nic_firmware_ext=raw.get("nic_firmware_ext"),
         extra_patches=list(raw.get("extra_patches", [])),
     )

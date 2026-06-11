@@ -26,18 +26,25 @@ LINK_ALIAS = "net0"  # single physical NIC, aliased structurally - no MAC, no pe
 
 
 def link_docs(node: Node) -> list[dict]:
-    """Alias the one physical NIC, then statically address + route it.
+    """Alias the uplink NIC, then statically address + route it.
 
     /32 address: a link-scope host route (no gateway key) reaches the gateway,
-    and the default route rides it. Mirrors Hetzner's single-IP layout. match:
-    true selects the sole physical link; logical links are auto-excluded.
+    and the default route rides it. Mirrors Hetzner's single-IP layout.
+
+    A fixed-string alias must match exactly ONE link, so `match: true` (sole
+    physical link, logical links auto-excluded) breaks on multi-NIC boxes: the
+    alias errors out and the node boots dark. node.link_mac, auto-discovered
+    during bring-up, pins the alias to the real uplink there.
     """
+    selector: dict = {"match": True}
+    if node.link_mac:  # mac() canonicalizes to lowercase-colon form, matching is_mac
+        selector = {"match": f'mac(link.permanent_addr) == "{node.link_mac}"'}
     return [
         {
             "apiVersion": "v1alpha1",
             "kind": "LinkAliasConfig",
             "name": LINK_ALIAS,
-            "selector": {"match": True},
+            "selector": selector,
         },
         {
             "apiVersion": "v1alpha1",
@@ -263,12 +270,12 @@ def run_config(ctx: Ctx, _node: Node | None) -> None:
     )
 
     for node in cluster.nodes:
-        _render_node(ctx, node)
+        render_node(ctx, node)
 
     paths.harden()
 
 
-def _render_node(ctx: Ctx, node: Node) -> None:
+def render_node(ctx: Ctx, node: Node) -> None:
     """Derive the per-node applied config from its role base via machineconfig patch."""
     paths = ctx.paths
     vswitch = ctx.cluster.vswitch

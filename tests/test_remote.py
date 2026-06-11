@@ -62,3 +62,13 @@ def test_select_disk_nvme_lowest_name_wins():
 
 def test_select_disk_explicit_disk_short_circuits():
     assert remote.select_disk(InstallTarget(disk="/dev/sdz"), []) == "/dev/sdz"
+
+
+def test_uplink_mac_normalizes(monkeypatch):
+    monkeypatch.setattr(remote, "exec", lambda *a, **k: _result("9C:6B:00:E7:84:16\n"))
+    assert remote.uplink_mac(remote.Session(host="1.2.3.4", tmp="/t")) == "9c:6b:00:e7:84:16"
+
+
+def test_uplink_mac_rejects_garbage(monkeypatch):
+    monkeypatch.setattr(remote, "exec", lambda *a, **k: _result("cat: no such file\n"))
+    assert remote.uplink_mac(remote.Session(host="1.2.3.4", tmp="/t")) is None

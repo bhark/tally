@@ -28,7 +28,7 @@ from griphtui import (
     warn,
 )
 
-from . import definition, disk, probe
+from . import definition, disk, probe, uplink
 from .constants import (
     DEFAULT_INSTALL_DISK,
     VLAN_ID_MAX,
@@ -58,7 +58,6 @@ from .stages import BY_KEY, Ctx, StageCancelled, StageDef, StageError
 from .ui import gap
 
 _CONFIG = BY_KEY[Stage.CONFIG]
-_IMAGE = BY_KEY[Stage.IMAGE]
 _RESCUE = BY_KEY[Stage.RESCUE]
 _APPLY = BY_KEY[Stage.APPLY]
 _BOOTSTRAP = BY_KEY[Stage.BOOTSTRAP]
@@ -241,8 +240,7 @@ def _bring_up_node(ctx: Ctx, node: Node, *, cluster_up: bool) -> None:
             _apply_and_verify(ctx, node)
         return
 
-    _ensure_image(ctx, node)
-    _run_phase(ctx, _RESCUE, node)  # ends with the node reachable in maintenance
+    _run_phase(ctx, _RESCUE, node)  # builds the image post-pin; ends reachable in maintenance
     _pin_and_render(ctx, node)
     _apply_and_verify(ctx, node)
 
@@ -278,28 +276,28 @@ def _apply_and_verify(ctx: Ctx, node: Node) -> None:
 
 
 def _pin_and_render(ctx: Ctx, node: Node) -> None:
-    """Bind install to the disk the node actually booted, then re-render if it changed.
+    """Bind install to the booted disk and the link alias to the uplink, re-render on change.
 
-    Resolved live from Talos' SystemDisk and kept only in the rendered config - the
-    declarative tally.yaml is untouched (see disk.resolve_system_selector). A node
-    with no clean signal keeps its declarative selector; the operator is told.
+    Both pins read live maintenance-mode state. The disk pin stays rendered-only (see
+    disk.resolve_system_selector); the MAC pin persists to tally.yaml - the image embed
+    depends on it, so reruns must see it before any rescue contact. A node with no clean
+    signal keeps its declarative values; the operator is told.
     """
     before = node.resolved_install
+    before_mac = node.link_mac
     selector = disk.resolve_system_selector(node.ip, ctx.talos_env())
     if selector:
         node.resolved_install = InstallTarget(selector=selector)
         note(f"{node.name}: install pinned to boot disk → {node.resolved_install.describe()}")
     else:
         warn(f"{node.name}: boot disk unresolved; keeping {node.install.describe()}")
-    if node.resolved_install != before:  # pin changed the effective target → re-render
+    mac = uplink.resolve_uplink_mac(node.ip, ctx.talos_env())
+    if mac and mac != node.link_mac:
+        node.link_mac = mac
+        definition.save(ctx.cluster, ctx.paths.defn)
+        note(f"{node.name}: link alias pinned to uplink mac {mac}")
+    if node.resolved_install != before or node.link_mac != before_mac:
         _run_phase(ctx, _CONFIG, None)
-
-
-def _ensure_image(ctx: Ctx, node: Node) -> None:
-    if ctx.paths.image(node).exists():
-        note(f"Reusing existing image {ctx.paths.image(node).name}")
-        return
-    _run_phase(ctx, _IMAGE, node)
 
 
 def _run_phase(ctx: Ctx, sd: StageDef, node: Node | None) -> None:
