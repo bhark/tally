@@ -21,6 +21,7 @@ STAGE_TOOLS: dict[Stage, tuple[str, ...]] = {
     Stage.APPLY: ("talosctl",),
     Stage.BOOTSTRAP: ("talosctl",),
     Stage.CILIUM: ("helm", "kubectl"),
+    Stage.REMOVE: ("talosctl", "kubectl"),
 }
 
 

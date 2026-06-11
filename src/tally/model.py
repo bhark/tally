@@ -40,6 +40,7 @@ class Stage(StrEnum):
     APPLY = "apply"
     BOOTSTRAP = "bootstrap"
     CILIUM = "cilium"
+    REMOVE = "remove"
 
 
 _IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")

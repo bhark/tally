@@ -79,6 +79,13 @@ def wait_until(
     return _poll(lambda: _attempt(cmd, env, PROBE_TIMEOUT), label, timeout, interval)
 
 
+def wait_gone(
+    cmd: list[str], env: dict[str, str], label: str, *, timeout: int, interval: int = 5
+) -> bool:
+    """poll until cmd STOPS exiting 0 (api went away). True => gone before timeout."""
+    return _poll(lambda: not _attempt(cmd, env, PROBE_TIMEOUT), label, timeout, interval)
+
+
 def wait_port(host: str, port: int, label: str, *, timeout: int, interval: int = 5) -> bool:
     """Poll a tcp port until it accepts a connection or timeout elapses."""
     return _poll(lambda: _tcp_open(host, port, PROBE_TIMEOUT), label, timeout, interval)
