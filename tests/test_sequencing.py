@@ -3,7 +3,15 @@ from __future__ import annotations
 import pytest
 
 from tally import wizard
-from tally.model import Cluster, CpuVendor, Node, NodeRole, Vswitch, default_cluster
+from tally.model import (
+    Cluster,
+    CpuVendor,
+    Node,
+    NodeRole,
+    Vswitch,
+    default_cluster,
+    next_vlan_ip,
+)
 from tally.paths import Paths
 from tally.stages import Ctx, StageCancelled
 
@@ -19,7 +27,7 @@ def test_vlan_ip_auto_assigns_by_role_range():
     cluster = Cluster(nodes=[], vswitch=Vswitch(vlan_id=4001, subnet="10.10.0.0/24"))
 
     def add(role):
-        ip = wizard._next_vlan_ip(cluster, role)
+        ip = next_vlan_ip(cluster, role)
         cluster.nodes.append(
             Node(name=f"n{len(cluster.nodes)}", role=role, cpu=CpuVendor.AMD, vlan_ip=ip)
         )
@@ -34,8 +42,8 @@ def test_vlan_ip_auto_assigns_by_role_range():
 def test_vlan_ip_returns_none_when_role_range_exhausted():
     # /26 has no .100, so the worker range can't be satisfied
     cluster = Cluster(nodes=[], vswitch=Vswitch(vlan_id=4002, subnet="10.20.0.0/26"))
-    assert wizard._next_vlan_ip(cluster, NodeRole.CONTROLPLANE) == "10.20.0.1"
-    assert wizard._next_vlan_ip(cluster, NodeRole.WORKER) is None
+    assert next_vlan_ip(cluster, NodeRole.CONTROLPLANE) == "10.20.0.1"
+    assert next_vlan_ip(cluster, NodeRole.WORKER) is None
 
 
 def _record(monkeypatch):
@@ -56,7 +64,7 @@ def test_fresh_cluster_full_walk_then_bootstrap_and_cilium(tmp_path, monkeypatch
     seq = _record(monkeypatch)
     _absent(monkeypatch)
     monkeypatch.setattr(wizard, "_cilium_installed", lambda ctx: False)
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: default)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: default)
     wizard._bring_up(_ctx(tmp_path))  # no kubeconfig → fresh
     assert seq == [
         ("config", None),
@@ -74,7 +82,7 @@ def test_existing_cluster_skips_joined_nodes_and_bootstrap(tmp_path, monkeypatch
     seq = _record(monkeypatch)
     monkeypatch.setattr(wizard, "_configured", lambda ctx, node: node.name == "cp1")  # cp1 live
     monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: False)  # worker1 absent
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: True)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: True)
     monkeypatch.setattr(wizard, "_cilium_installed", lambda ctx: True)  # healthy cluster → CNI up
     ctx = _ctx(tmp_path)
     ctx.paths.kubeconfig.write_text("kube\n")  # already bootstrapped
@@ -99,7 +107,7 @@ def test_bootstrapped_but_cilium_absent_reinstalls(tmp_path, monkeypatch):
     seq = _record(monkeypatch)
     monkeypatch.setattr(wizard, "_configured", lambda ctx, node: True)  # both joined
     monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: False)
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: True)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: True)
     monkeypatch.setattr(wizard, "_cilium_installed", lambda ctx: False)  # install failed last run
     ctx = _ctx(tmp_path)
     ctx.paths.kubeconfig.write_text("kube\n")
@@ -116,7 +124,7 @@ def test_maintenance_node_applies_only(tmp_path, monkeypatch):
     monkeypatch.setattr(wizard, "_configured", lambda ctx, node: False)
     monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: True)  # imaged, not applied
     monkeypatch.setattr(wizard, "_cilium_installed", lambda ctx: False)
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: default)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: default)
     wizard._bring_up(_ctx(tmp_path))
     assert seq == [
         ("config", None),
@@ -137,7 +145,7 @@ def test_configured_pre_bootstrap_reapplies(tmp_path, monkeypatch):
     monkeypatch.setattr(wizard, "_in_maintenance", lambda ctx, node: False)
     monkeypatch.setattr(wizard, "_configured", lambda ctx, node: True)  # both already have config
     monkeypatch.setattr(wizard, "_cilium_installed", lambda ctx: False)
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: default)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: default)
     wizard._bring_up(_ctx(tmp_path))  # no kubeconfig → pre-bootstrap
     assert seq == [
         ("config", None),
@@ -151,7 +159,7 @@ def test_configured_pre_bootstrap_reapplies(tmp_path, monkeypatch):
 def test_declined_bootstrap_skips_but_continues_to_cilium(tmp_path, monkeypatch):
     seq = _record(monkeypatch)
     _absent(monkeypatch)
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: False)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: False)
     ctx = _ctx(tmp_path)
     ctx.cluster.nodes = ctx.cluster.nodes[:1]
     wizard._bring_up(ctx)
@@ -170,7 +178,7 @@ def test_cancel_aborts_remaining_phases(tmp_path, monkeypatch):
 
     monkeypatch.setattr(wizard, "_run_phase", fake)
     _absent(monkeypatch)
-    monkeypatch.setattr(wizard, "_ask", lambda label, *, default: False)
+    monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: False)
     ctx = _ctx(tmp_path)
     ctx.cluster.nodes = ctx.cluster.nodes[:1]
 

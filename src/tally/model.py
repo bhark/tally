@@ -7,7 +7,14 @@ import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from .constants import DEFAULT_INSTALL_DISK, VLAN_ID_MAX, VLAN_ID_MIN, VSWITCH_MTU_DEFAULT
+from .constants import (
+    DEFAULT_INSTALL_DISK,
+    VLAN_ID_MAX,
+    VLAN_ID_MIN,
+    VSWITCH_CP_HOST_START,
+    VSWITCH_MTU_DEFAULT,
+    VSWITCH_WORKER_HOST_START,
+)
 
 
 class NodeRole(StrEnum):
@@ -235,3 +242,18 @@ def default_cluster() -> Cluster:
             Node(name="worker1", role=NodeRole.WORKER, cpu=CpuVendor.AMD),
         ]
     )
+
+
+def next_vlan_ip(cluster: Cluster, role: NodeRole) -> str | None:
+    """Lowest free host in the vswitch subnet for the role: CPs from .1, workers from
+    .100, so the role reads off the address. None if that role's range is exhausted."""
+    vswitch = cluster.vswitch
+    net = vswitch.subnet_network
+    base = int(net.network_address)
+    start = VSWITCH_CP_HOST_START if role is NodeRole.CONTROLPLANE else VSWITCH_WORKER_HOST_START
+    used = {n.vlan_ip for n in cluster.nodes if n.vlan_ip}
+    for host in range(start, net.num_addresses):
+        candidate = str(ipaddress.IPv4Address(base + host))
+        if is_host_in_subnet(candidate, vswitch.subnet) and candidate not in used:
+            return candidate
+    return None

@@ -9,13 +9,11 @@ rescue + apply). Adding to an already-bootstrapped cluster skips bootstrap+ciliu
 
 from __future__ import annotations
 
-import ipaddress
 import shutil
 import traceback
 
 from griphtui import (
     Option,
-    confirm,
     error,
     intro,
     is_cancel,
@@ -24,22 +22,16 @@ from griphtui import (
     select,
     spinner,
     success,
-    text,
     warn,
 )
 
-from . import definition, disk, probe, uplink
+from . import definition, disk, probe, prompts, uplink
 from .constants import (
     DEFAULT_INSTALL_DISK,
-    VLAN_ID_MAX,
-    VLAN_ID_MIN,
-    VSWITCH_CP_HOST_START,
     VSWITCH_MTU_DEFAULT,
     VSWITCH_SUBNET_DEFAULT,
-    VSWITCH_WORKER_HOST_START,
 )
 from .model import (
-    Cluster,
     CpuVendor,
     InstallTarget,
     Node,
@@ -47,15 +39,12 @@ from .model import (
     ProfileKey,
     Stage,
     Vswitch,
-    is_dns_label,
-    is_host_in_subnet,
-    is_ipv4,
+    next_vlan_ip,
 )
 from .preflight import check_tools, missing_for_stage, summary_lines
-from .profiles import profile_for
 from .runner import CommandError
 from .stages import BY_KEY, Ctx, StageCancelled, StageDef, StageError
-from .ui import gap
+from .ui import gap, inventory_lines, node_line
 
 _CONFIG = BY_KEY[Stage.CONFIG]
 _RESCUE = BY_KEY[Stage.RESCUE]
@@ -103,7 +92,7 @@ def _define_cluster(ctx: Ctx) -> bool:
         if cluster.name:
             note(cluster.name, title="Cluster")
         if cluster.nodes:
-            note(_inventory_lines(cluster), title="Nodes")
+            note(inventory_lines(cluster), title="Nodes")
         else:
             note("No nodes yet", title="Nodes")
         problems = cluster.problems() + [p for n in cluster.nodes for p in n.problems()]
@@ -156,7 +145,7 @@ def _bring_up(ctx: Ctx) -> None:
 
     if not cluster_up:
         gap()
-        if _ask("Bootstrap etcd now? once per cluster", default=True):
+        if prompts.ask("Bootstrap etcd now? once per cluster", default=True):
             _run_phase(ctx, _BOOTSTRAP, None)
         else:
             note("Skipped bootstrap")
@@ -225,7 +214,7 @@ def _cilium_installed(ctx: Ctx) -> bool:
 
 def _bring_up_node(ctx: Ctx, node: Node, *, cluster_up: bool) -> None:
     gap()
-    note(_node_line(node), title=f"Bring up {node.name}")
+    note(node_line(node), title=f"Bring up {node.name}")
 
     if _in_maintenance(ctx, node):
         note(f"{node.name} in maintenance → applying config")
@@ -355,17 +344,17 @@ def _configure_vswitch(ctx: Ctx) -> None:
     """Prompt VLAN ID + subnet (MTU defaulted to the Hetzner cap), persist tally.yaml."""
     cluster = ctx.cluster
     current = cluster.vswitch
-    vlan = _ask_text(
+    vlan = prompts.ask_text(
         "vSwitch VLAN ID",
         default=str(current.vlan_id) if current else "",
-        validate=_vlan_id_validator,
+        validate=prompts.vlan_id_validator,
     )
     if vlan is None:
         return
-    subnet = _ask_text(
+    subnet = prompts.ask_text(
         "vSwitch subnet (CIDR, pick whatever you like)",
         default=current.subnet if current else VSWITCH_SUBNET_DEFAULT,
-        validate=_cidr_validator,
+        validate=prompts.cidr_validator,
     )
     if subnet is None:
         return
@@ -377,7 +366,7 @@ def _configure_vswitch(ctx: Ctx) -> None:
 def _set_cluster_name(ctx: Ctx) -> None:
     """Prompt the cluster name once; baked into gen config, so fix later by hand-editing."""
     cluster = ctx.cluster
-    name = _ask_text("Cluster name", validate=_cluster_name_validator)
+    name = prompts.ask_text("Cluster name", validate=prompts.cluster_name_validator)
     if name is None:
         return
     cluster.name = name
@@ -391,39 +380,39 @@ def _set_cluster_name(ctx: Ctx) -> None:
 def _add_node(ctx: Ctx) -> None:
     """Prompt a full node (role first), append on success. Any cancel aborts cleanly."""
     cluster = ctx.cluster
-    role = _ask_role()
+    role = prompts.ask_role()
     if role is None:
         return
     label = "control-plane" if role is NodeRole.CONTROLPLANE else "worker"
-    name = _ask_text(f"{label.capitalize()} name", validate=_name_validator(cluster))
+    name = prompts.ask_text(f"{label.capitalize()} name", validate=prompts.name_validator(cluster))
     if name is None:
         return
-    cpu = _ask_cpu(CpuVendor.AMD)
+    cpu = prompts.ask_cpu(CpuVendor.AMD)
     if cpu is None:
         return
-    profile = _ask_profile(ProfileKey.GENERIC)
+    profile = prompts.ask_profile(ProfileKey.GENERIC)
     if profile is None:
         return
-    ip = _ask_text("IPv4 address", validate=_ipv4_validator)
+    ip = prompts.ask_text("IPv4 address", validate=prompts.ipv4_validator)
     if ip is None:
         return
-    gateway = _ask_text("Gateway", validate=_ipv4_validator)
+    gateway = prompts.ask_text("Gateway", validate=prompts.ipv4_validator)
     if gateway is None:
         return
     vlan_ip = ""
     if cluster.vswitch is not None:  # auto-assigned, not prompted: CP from .1, worker from .100
-        vlan_ip = _next_vlan_ip(cluster, role)
+        vlan_ip = next_vlan_ip(cluster, role)
         if vlan_ip is None:
             error(f"No free vSwitch IP for a {label} in {cluster.vswitch.subnet}")
             return
         note(f"vSwitch IP auto-assigned: {vlan_ip}")
-    install = _ask_install_target(InstallTarget(disk=DEFAULT_INSTALL_DISK), profile)
+    install = prompts.ask_install_target(InstallTarget(disk=DEFAULT_INSTALL_DISK), profile)
     if install is None:
         return
-    fw = _ask_text("Extra NIC firmware extension ref (blank if none)", default="")
+    fw = prompts.ask_text("Extra NIC firmware extension ref (blank if none)", default="")
     if fw is None:
         return
-    extra = _ask_extra_patches([])
+    extra = prompts.ask_extra_patches([])
     if extra is None:
         return
     cluster.nodes.append(
@@ -444,111 +433,6 @@ def _add_node(ctx: Ctx) -> None:
     success(f"Added {label} {name}")
 
 
-def _ask_role() -> NodeRole | None:
-    choice = select(
-        "Node role",
-        [
-            Option(label="Control plane", value=NodeRole.CONTROLPLANE),
-            Option(label="Worker", value=NodeRole.WORKER),
-        ],
-    )
-    return None if is_cancel(choice) else choice
-
-
-def _ask_cpu(default: CpuVendor) -> CpuVendor | None:
-    choice = select(
-        "CPU vendor",
-        [
-            Option(label="amd", value=CpuVendor.AMD, selected=default is CpuVendor.AMD),
-            Option(label="intel", value=CpuVendor.INTEL, selected=default is CpuVendor.INTEL),
-        ],
-    )
-    return None if is_cancel(choice) else choice
-
-
-def _ask_profile(default: ProfileKey) -> ProfileKey | None:
-    options = [
-        Option(
-            label=p.value,
-            value=p,
-            hint=profile_for(p).install_hint or None,
-            selected=(p is default),
-        )
-        for p in ProfileKey
-    ]
-    choice = select("Workload profile", options)
-    return None if is_cancel(choice) else choice
-
-
-def _ask_install_target(default: InstallTarget, profile: ProfileKey) -> InstallTarget | None:
-    hint = profile_for(profile).install_hint
-    if hint:
-        note(hint, title="Install-target guidance")
-    mode = select(
-        "Install target",
-        [
-            Option(
-                label="Disk selector (preferred, stable across NVMe reordering)",
-                value="selector",
-                selected=default.selector is not None,
-            ),
-            Option(label="Explicit /dev path", value="disk", selected=default.disk is not None),
-        ],
-    )
-    if is_cancel(mode):
-        return None
-    if mode == "disk":
-        disk = _ask_text(
-            "Install disk",
-            default=default.disk or DEFAULT_INSTALL_DISK,
-            validate=_dev_path_validator,
-        )
-        return None if disk is None else InstallTarget(disk=disk)
-    return _ask_selector(default.selector or {})
-
-
-def _ask_selector(default: dict[str, str]) -> InstallTarget | None:
-    dtype = select(
-        "Disk type",
-        [Option(label="any", value="", selected="type" not in default)]
-        + [
-            Option(label=t, value=t, selected=default.get("type") == t)
-            for t in ("nvme", "ssd", "hdd", "sd")
-        ],
-    )
-    if is_cancel(dtype):
-        return None
-    size = _ask_text(
-        "Size expression (e.g. '<= 4TB', blank to skip)", default=default.get("size", "")
-    )
-    if size is None:
-        return None
-    model = _ask_text("Model substring (blank to skip)", default=default.get("model", ""))
-    if model is None:
-        return None
-    selector = {k: v for k, v in (("type", dtype), ("size", size), ("model", model)) if v}
-    if not selector:
-        warn("A diskSelector needs at least one field; nothing changed")
-        return None
-    return InstallTarget(selector=selector)
-
-
-def _ask_extra_patches(default: list[str]) -> list[str] | None:
-    """Opt-in bring-your-own --config-patch files. Cancel ⇒ None (abort add), no ⇒ []."""
-    answer = confirm("Add bring-your-own config-patch files?", default=bool(default))
-    if is_cancel(answer):
-        return None
-    if not answer:
-        return []
-    raw = _ask_text(
-        "Patch file path(s), comma-separated (relative to where you run tally)",
-        default=", ".join(default),
-    )
-    if raw is None:
-        return None
-    return [p.strip() for p in raw.split(",") if p.strip()]
-
-
 # small helpers -------------------------------------------------------------
 
 
@@ -562,91 +446,3 @@ def _show_preflight() -> None:
 
 def _label(sd: StageDef, node: Node | None) -> str:
     return f"{sd.title} ({node.name})" if node is not None else sd.title
-
-
-def _inventory_lines(cluster: Cluster) -> list[str]:
-    width = max((len(n.name) for n in cluster.nodes), default=0)
-    return [f"{n.name.ljust(width)}  {_node_line(n)}" for n in cluster.nodes]
-
-
-def _node_line(node: Node) -> str:
-    role = f"{node.role.value}/{node.cpu.value}/{node.profile.value}"
-    net = f"{node.ip or '?'} → {node.gateway or '?'}"
-    vlan = f"  vlan {node.vlan_ip}" if node.vlan_ip else ""
-    extra = f"  +{len(node.extra_patches)} patch" if node.extra_patches else ""
-    return f"{role:<22}  {net}{vlan}  {node.install.describe()}{extra}"
-
-
-def _ask(label: str, *, default: bool) -> bool:
-    answer = confirm(label, default=default)
-    return False if is_cancel(answer) else answer
-
-
-def _ask_text(label: str, *, default: str = "", validate=None) -> str | None:
-    value = text(label, default=default, validate=validate)
-    if is_cancel(value):
-        return None
-    return value.strip()
-
-
-def _ipv4_validator(v: str) -> str | None:
-    return None if is_ipv4(v.strip()) else "Expected a dotted IPv4 address"
-
-
-def _dev_path_validator(v: str) -> str | None:
-    return None if v.strip().startswith("/dev/") else "Expected a /dev path"
-
-
-def _vlan_id_validator(v: str) -> str | None:
-    v = v.strip()
-    if not v.isdigit():
-        return "Expected a numeric VLAN ID"
-    if not VLAN_ID_MIN <= int(v) <= VLAN_ID_MAX:
-        return f"VLAN ID must be in [{VLAN_ID_MIN}, {VLAN_ID_MAX}]"
-    return None
-
-
-def _cidr_validator(v: str) -> str | None:
-    try:
-        ipaddress.IPv4Network(v.strip(), strict=False)
-    except (ipaddress.AddressValueError, ValueError):
-        return "Expected an IPv4 CIDR, e.g. 10.10.0.0/24"
-    return None
-
-
-def _next_vlan_ip(cluster: Cluster, role: NodeRole) -> str | None:
-    """Lowest free host in the vswitch subnet for the role: CPs from .1, workers from
-    .100, so the role reads off the address. None if that role's range is exhausted."""
-    vswitch = cluster.vswitch
-    net = vswitch.subnet_network
-    base = int(net.network_address)
-    start = VSWITCH_CP_HOST_START if role is NodeRole.CONTROLPLANE else VSWITCH_WORKER_HOST_START
-    used = {n.vlan_ip for n in cluster.nodes if n.vlan_ip}
-    for host in range(start, net.num_addresses):
-        candidate = str(ipaddress.IPv4Address(base + host))
-        if is_host_in_subnet(candidate, vswitch.subnet) and candidate not in used:
-            return candidate
-    return None
-
-
-def _name_validator(cluster: Cluster):
-    def validate(v: str) -> str | None:
-        v = v.strip()
-        if not v:
-            return "Name is required"
-        if not is_dns_label(v):
-            return "Must be a DNS-1123 label (lowercase alphanumeric + -, ≤63 chars)"
-        if any(n.name == v for n in cluster.nodes):
-            return f"Name {v!r} already in use"
-        return None
-
-    return validate
-
-
-def _cluster_name_validator(v: str) -> str | None:
-    v = v.strip()
-    if not v:
-        return "Name is required"
-    if not is_dns_label(v):
-        return "Must be a DNS-1123 label (lowercase alphanumeric + -, ≤63 chars)"
-    return None
