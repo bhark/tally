@@ -27,10 +27,6 @@ def check(cmd: list[str], env: dict[str, str], *, timeout: int = PROBE_TIMEOUT) 
     return proc.returncode == 0
 
 
-def _attempt(cmd: list[str], env: dict[str, str], timeout: int) -> bool:
-    return check(cmd, env, timeout=timeout)
-
-
 def _stdout(cmd: list[str], env: dict[str, str], timeout: int) -> str | None:
     # None ⇒ couldn't run or non-zero exit; distinct from an empty-but-successful read
     try:
@@ -69,21 +65,21 @@ def read(cmd: list[str], env: dict[str, str], *, timeout: int = PROBE_TIMEOUT) -
 def reachable(cmd: list[str], env: dict[str, str], label: str) -> bool:
     # transient spinner; caller notes the outcome, so no done/fail line
     with spinner(label):
-        return _attempt(cmd, env, PROBE_TIMEOUT)
+        return check(cmd, env)
 
 
 def wait_until(
     cmd: list[str], env: dict[str, str], label: str, *, timeout: int, interval: int = 5
 ) -> bool:
     """Poll cmd until it exits 0 or timeout elapses. True ⇒ became reachable."""
-    return _poll(lambda: _attempt(cmd, env, PROBE_TIMEOUT), label, timeout, interval)
+    return _poll(lambda: check(cmd, env), label, timeout, interval)
 
 
 def wait_gone(
     cmd: list[str], env: dict[str, str], label: str, *, timeout: int, interval: int = 5
 ) -> bool:
     """poll until cmd STOPS exiting 0 (api went away). True => gone before timeout."""
-    return _poll(lambda: not _attempt(cmd, env, PROBE_TIMEOUT), label, timeout, interval)
+    return _poll(lambda: not check(cmd, env), label, timeout, interval)
 
 
 def wait_port(host: str, port: int, label: str, *, timeout: int, interval: int = 5) -> bool:

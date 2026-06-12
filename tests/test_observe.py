@@ -48,7 +48,7 @@ def _k8s_payload():
 
 
 def test_parse_orphans_names_addresses_and_cp_label():
-    orphans = parse_orphans(_k8s_payload(), {"cp1"})
+    orphans = parse_orphans(_k8s_payload(), {"cp1"}, set())
     names = [o.name for o in orphans]
     assert names == ["old-cp", "old-worker"]  # cp1 is desired, excluded
 
@@ -62,14 +62,22 @@ def test_parse_orphans_names_addresses_and_cp_label():
 
 def test_parse_orphans_tolerates_missing_keys():
     raw = json.dumps({"items": [{"metadata": {"name": "x"}}, {}, {"metadata": {}}]})
-    orphans = parse_orphans(raw, set())
+    orphans = parse_orphans(raw, set(), set())
     assert [o.name for o in orphans] == ["x"]
     assert orphans[0].addresses == []
     assert orphans[0].control_plane is False
 
 
 def test_parse_orphans_bad_json():
-    assert parse_orphans("not json", set()) == []
+    assert parse_orphans("not json", set(), set()) == []
+
+
+def test_parse_orphans_excludes_live_node_by_address():
+    """A live desired node registered under a different k8s name (rename / hostname drift) is
+    matched by address and never treated as an orphan to be reset."""
+    # old-cp's InternalIP 10.0.0.9 belongs to a desired node whose name differs ("cpX")
+    orphans = parse_orphans(_k8s_payload(), {"cp1"}, {"10.0.0.9"})
+    assert [o.name for o in orphans] == ["old-worker"]  # old-cp excluded by address match
 
 
 def test_snapshot_classifies_per_node(monkeypatch, tmp_path):
@@ -106,6 +114,23 @@ def test_snapshot_classifies_per_node(monkeypatch, tmp_path):
         "maint-n": NodeState.MAINTENANCE,
         "absent-n": NodeState.ABSENT,
     }
+    assert snap.etcd_bootstrapped is True  # joined CP answers `etcd members`
+
+
+def test_snapshot_etcd_not_bootstrapped_without_joined_cp(monkeypatch, tmp_path):
+    paths = Paths(tmp_path / "talos", tmp_path / "talos-secrets")
+    paths.ensure()
+    paths.talosconfig.write_text("ctx")
+    cluster = Cluster(nodes=[_node("cp1", NodeRole.CONTROLPLANE, ip="10.0.0.1")], name="c")
+
+    monkeypatch.setattr(observe.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    # secure probe fails -> cp classified absent -> etcd never probed
+    monkeypatch.setattr(observe.probe, "check", lambda cmd, env, **k: False)
+    monkeypatch.setattr(observe.probe, "read", lambda *a, **k: None)
+
+    snap = snapshot(cluster, paths, {})
+    assert snap.states == {"cp1": NodeState.ABSENT}
+    assert snap.etcd_bootstrapped is False
 
 
 def test_snapshot_fresh_repo_all_absent(monkeypatch, tmp_path):
@@ -119,6 +144,7 @@ def test_snapshot_fresh_repo_all_absent(monkeypatch, tmp_path):
     assert snap.states == {"cp1": NodeState.ABSENT}
     assert snap.k8s_reachable is False
     assert snap.cilium_installed is False
+    assert snap.etcd_bootstrapped is False
     assert snap.orphans == []
 
 

@@ -27,13 +27,14 @@ from griphtui import (
     warn,
 )
 
-from . import definition, disk, observe, probe, prompts, removal, screens, uplink
+from . import cluster_ops, definition, disk, observe, probe, prompts, removal, screens, uplink
 from .menu import Exit
 from .model import InstallTarget, Node, Stage
 from .preflight import check_tools, missing_for_stage, summary_lines
 from .reconcile import Action, ActionKind, compute
 from .runner import CommandError
 from .stages import BY_KEY, Ctx, StageCancelled, StageDef, StageError
+from .stages.s1_config import render_node
 from .stages.s4_apply import DryRunVerdict, dry_run
 from .ui import gap, node_line
 
@@ -74,8 +75,7 @@ def run(ctx: Ctx) -> None:
 
 
 def _bring_up(ctx: Ctx, snap: observe.Snapshot) -> None:
-    cluster_up = ctx.paths.kubeconfig.exists()
-    plan = compute(ctx.cluster, snap, cluster_up=cluster_up)
+    plan = compute(ctx.cluster, snap)
     _run_phase(ctx, _CONFIG, None)  # regen all per-node configs (idempotent)
 
     for action in plan.actions:
@@ -99,6 +99,8 @@ def _bring_up(ctx: Ctx, snap: observe.Snapshot) -> None:
     removals = [a for a in plan.actions if a.kind is ActionKind.REMOVE]
     if removals:
         _remove_orphans(ctx, removals)
+    elif snap.etcd_bootstrapped and not snap.k8s_reachable:
+        note("k8s API unreachable - orphan detection skipped")
 
     _verify_workers_ready(ctx)
 
@@ -122,14 +124,16 @@ def _run_node_action(ctx: Ctx, action: Action) -> None:
 
 
 def _converge(ctx: Ctx, node: Node) -> None:
-    """Joined node: dry-run, apply only on real drift, confirm a reboot.
+    """Joined node: re-pin the boot disk over the secure API, dry-run, apply only on real drift.
 
-    No pin/rescue - the maintenance API is gone, the rendered config already carries the
-    persisted link_mac, and config just regenerated. A reboot-requiring apply is the
-    operator's call; a no-reboot apply lands silently.
+    The disk pin is transient (never serialised), so without re-deriving it here the regen
+    renders the declarative install and the dry-run reports perpetual machine.install drift on
+    a healthy node. link_mac is persisted, so only the disk needs re-pinning; no rescue. A
+    reboot-requiring apply is the operator's call; a no-reboot apply lands silently.
     """
     if not node.ip or not ctx.paths.talosconfig.exists() or shutil.which("talosctl") is None:
         return
+    _repin_disk(ctx, node)
     verdict, diff = dry_run(ctx, node)
     if verdict is DryRunVerdict.IN_SYNC:
         note(f"{node.name} in sync → skipping")
@@ -146,6 +150,17 @@ def _converge(ctx: Ctx, node: Node) -> None:
         warn(f"{node.name} apply skipped - node remains drifted")
 
 
+def _repin_disk(ctx: Ctx, node: Node) -> None:
+    """Re-derive the boot-disk selector over the secure API and re-render this node, so the
+    regenerated config carries the same diskSelector the live node holds (no perpetual drift)."""
+    selector = disk.resolve_system_selector(node.ip, ctx.talos_env(), secure=True)
+    if not selector:
+        return
+    node.resolved_install = InstallTarget(selector=selector)
+    render_node(ctx, node)
+    ctx.paths.harden()
+
+
 def _remove_orphans(ctx: Ctx, removals: list[Action]) -> None:
     missing = missing_for_stage(Stage.REMOVE)
     if missing:
@@ -153,7 +168,7 @@ def _remove_orphans(ctx: Ctx, removals: list[Action]) -> None:
         return
     env = ctx.talos_env()
     orphans = [a.orphan for a in removals if a.orphan is not None]
-    removal.repoint_endpoints(ctx.cluster, env)  # operator hop, off any orphan endpoint
+    cluster_ops.set_endpoints(ctx.cluster, env)  # operator hop, off any orphan endpoint
     removal.protect_kubeconfig(ctx.cluster, ctx.paths, orphans)
     for action in removals:
         gap()
@@ -166,8 +181,8 @@ def _confirm_and_remove(ctx: Ctx, action: Action, env: dict[str, str]) -> None:
     addrs = ", ".join(orphan.addresses) or "no known address"
     role = "control-plane" if orphan.control_plane else "worker"
     note(f"{orphan.name}  {role}  {addrs}", title="Orphan (live, not in tally.yaml)")
-    if action.hint and action.hint.startswith("refusing"):
-        warn(action.hint)
+    if action.refuse:
+        warn(f"Refusing to remove {orphan.name}: {action.hint}")
         return
     if action.hint:
         warn(action.hint)

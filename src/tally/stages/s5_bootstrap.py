@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from griphtui import confirm, is_cancel, note
 
-from .. import probe
-from ..constants import K8S_API_PORT
+from .. import cluster_ops, probe
 from ..model import Node, Stage
 from ..runner import run
 from .base import Ctx, StageCancelled, StageDef
@@ -15,7 +14,6 @@ _SYNC_TIMEOUT = 150  # first NTP sync on a freshly-booted bare-metal CP; generou
 
 def run_bootstrap(ctx: Ctx, _node: Node | None) -> None:
     cp = ctx.cluster.bootstrap_cp
-    cp_ips = [n.ip for n in ctx.cluster.control_planes]
     # rpcs relay via an arbitrary cp endpoint; hetzner firewalls inter-node public
     # :50000, so the relay's dial must ride the vswitch when there is one
     node_ip = cp.vlan_ip if ctx.cluster.vswitch else cp.ip
@@ -23,7 +21,7 @@ def run_bootstrap(ctx: Ctx, _node: Node | None) -> None:
     paths = ctx.paths
 
     # endpoints stay public CP IPs - the operator hop (admin → :50000 is firewall-allowed)
-    run(["talosctl", "config", "endpoint", *cp_ips], label="Set talosconfig endpoints", env=env)
+    cluster_ops.set_endpoints(ctx.cluster, env)
     run(["talosctl", "config", "node", node_ip], label="Set talosconfig node", env=env)
 
     # etcd answers member list only once bootstrapped; skip re-bootstrap on resume
@@ -52,15 +50,10 @@ def _rewrite_kubeconfig_server(ctx: Ctx, cp: Node) -> None:
     vswitch = ctx.cluster.vswitch
     if vswitch is None:
         return
-    private = f"https://{cp.vlan_ip}:{K8S_API_PORT}"
-    public = f"https://{cp.ip}:{K8S_API_PORT}"
-    kubeconfig = ctx.paths.kubeconfig
-    text = kubeconfig.read_text()
-    if private not in text:
-        note(f"Kubeconfig server is not {private}; left unchanged")
-        return
-    kubeconfig.write_text(text.replace(private, public))
-    note(f"Rewrote kubeconfig server {private} → {public}")
+    if cluster_ops.rewrite_kubeconfig_server(ctx.paths.kubeconfig, cp.vlan_ip, cp.ip):
+        note(f"Rewrote kubeconfig server {cp.vlan_ip} → {cp.ip} (public)")
+    else:
+        note("Kubeconfig server is not the private vSwitch IP; left unchanged")
 
 
 def _await_timesync(ctx: Ctx, cp: Node, node_ip: str) -> None:

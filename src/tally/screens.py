@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from griphtui import confirm, error, is_cancel, note, success
+from griphtui import confirm, error, is_cancel, note, success, warn
 
 from . import definition, observe, prompts
 from .constants import DEFAULT_INSTALL_DISK, VSWITCH_MTU_DEFAULT, VSWITCH_SUBNET_DEFAULT
 from .menu import BACK, STAY, Exit, Item, Menu, item, submenu
-from .model import CpuVendor, InstallTarget, Node, ProfileKey, Vswitch, next_vlan_ip
+from .model import CpuVendor, InstallTarget, Node, NodeRole, ProfileKey, Vswitch, next_vlan_ip
 from .observe import NodeState, Snapshot
 from .reconcile import compute, describe, locked_fields
 from .stages.base import Ctx
@@ -26,10 +26,6 @@ from .ui import inventory_lines, node_line
 class ScreenState:
     ctx: Ctx
     snap: Snapshot
-
-
-def _cluster_up(state: ScreenState) -> bool:
-    return state.ctx.paths.kubeconfig.exists()
 
 
 def _problems(cluster) -> list[str]:
@@ -46,17 +42,19 @@ def _save(state: ScreenState) -> None:
 def main_menu(state: ScreenState) -> Menu:
     def header() -> None:
         cluster = state.ctx.cluster
+        problems = _problems(cluster)
         if cluster.name:
             note(cluster.name, title="Cluster")
         if cluster.nodes:
             note(inventory_lines(cluster, state.snap), title="Nodes")
         else:
             note("No nodes yet", title="Nodes")
-        problems = _problems(cluster)
-        if problems:
+        if problems:  # gates compute: bootstrap_cp would raise with zero control-planes
             note(problems, title="Resolve before bring-up")
-        plan = compute(cluster, state.snap, cluster_up=_cluster_up(state))
-        note(describe(plan), title="Cluster state")
+        else:
+            note(describe(compute(cluster, state.snap)), title="Cluster state")
+        if state.snap.etcd_bootstrapped and not state.snap.k8s_reachable:
+            note("k8s API unreachable - orphan detection skipped")
 
     def items() -> list[Item]:
         cluster = state.ctx.cluster
@@ -209,13 +207,17 @@ def _delete_item(state: ScreenState, node: Node) -> Item:
     live = state.snap.states.get(node.name) is not NodeState.ABSENT
 
     def run():
+        cluster = state.ctx.cluster
+        if node.role is NodeRole.CONTROLPLANE and len(cluster.control_planes) == 1:
+            warn("cluster needs at least one control-plane; add another before removing this one")
+            return STAY
         label = f"Delete {node.name}?"
         if live:
             label += " node is live; Tally Up will propose removing it from the cluster"
         answer = confirm(label, default=False)
         if is_cancel(answer) or not answer:
             return STAY
-        state.ctx.cluster.nodes.remove(node)
+        cluster.nodes.remove(node)
         _save(state)
         success(f"Removed {node.name}")
         return BACK

@@ -20,8 +20,6 @@ from . import probe
 from .model import Cluster
 from .paths import Paths
 
-_PROBE_TIMEOUT = 5
-
 
 class NodeState(StrEnum):
     JOINED = "joined"
@@ -42,10 +40,15 @@ class Snapshot:
     orphans: list[Orphan]
     k8s_reachable: bool  # False => orphans unknowable (fresh repo / api down)
     cilium_installed: bool
+    etcd_bootstrapped: bool  # a joined CP answers etcd members - real bootstrap state
 
 
-def parse_orphans(raw_json: str, desired_names: set[str]) -> list[Orphan]:
-    """Pure: k8s nodes absent from the desired set, with addresses ExternalIP-then-InternalIP."""
+def parse_orphans(raw_json: str, desired_names: set[str], desired_addrs: set[str]) -> list[Orphan]:
+    """Pure: k8s nodes absent from the desired set, with addresses ExternalIP-then-InternalIP.
+
+    A live desired node is matched by name OR by address (its public ip / vlan_ip), so a
+    renamed or hostname-drifted node is never mistaken for an orphan and reset.
+    """
     try:
         payload = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError):
@@ -65,6 +68,8 @@ def parse_orphans(raw_json: str, desired_names: set[str]) -> list[Orphan]:
         internal = [
             a["address"] for a in addrs if a.get("type") == "InternalIP" and a.get("address")
         ]
+        if desired_addrs.intersection(external + internal):  # live desired node, different name
+            continue
         out.append(
             Orphan(
                 name=name,
@@ -78,13 +83,9 @@ def parse_orphans(raw_json: str, desired_names: set[str]) -> list[Orphan]:
 def _classify(ip: str, env: dict[str, str], secure_ok: bool) -> NodeState:
     if not ip:
         return NodeState.ABSENT
-    if secure_ok and probe.check(
-        ["talosctl", "-e", ip, "-n", ip, "version"], env, timeout=_PROBE_TIMEOUT
-    ):
+    if secure_ok and probe.check(["talosctl", "-e", ip, "-n", ip, "version"], env):
         return NodeState.JOINED
-    if probe.check(
-        ["talosctl", "-n", ip, "get", "disks", "--insecure"], env, timeout=_PROBE_TIMEOUT
-    ):
+    if probe.check(["talosctl", "-n", ip, "get", "disks", "--insecure"], env):
         return NodeState.MAINTENANCE
     return NodeState.ABSENT
 
@@ -103,12 +104,23 @@ def snapshot(cluster: Cluster, paths: Paths, env: dict[str, str]) -> Snapshot:
             states = dict(pool.map(classify, cluster.nodes))
 
     orphans, k8s_reachable, cilium_installed = _k8s_facts(cluster, paths, env)
+    etcd_bootstrapped = _etcd_bootstrapped(cluster, states, env) if secure_ok else False
     return Snapshot(
         states=states,
         orphans=orphans,
         k8s_reachable=k8s_reachable,
         cilium_installed=cilium_installed,
+        etcd_bootstrapped=etcd_bootstrapped,
     )
+
+
+def _etcd_bootstrapped(cluster: Cluster, states: dict[str, NodeState], env: dict[str, str]) -> bool:
+    """True iff a joined control-plane answers `etcd members` - real bootstrap state, not a flag."""
+    for cp in cluster.control_planes:
+        if states.get(cp.name) is NodeState.JOINED and cp.ip:
+            if probe.check(["talosctl", "-e", cp.ip, "-n", cp.ip, "etcd", "members"], env):
+                return True
+    return False
 
 
 def _k8s_facts(
@@ -120,7 +132,11 @@ def _k8s_facts(
     out = probe.read(["kubectl", "--kubeconfig", kc, "get", "nodes", "-o", "json"], env)
     if out is None:
         return [], False, False
-    orphans = parse_orphans(out, {n.name for n in cluster.nodes})
+    desired_names = {n.name for n in cluster.nodes}
+    desired_addrs = {n.ip for n in cluster.nodes if n.ip} | {
+        n.vlan_ip for n in cluster.nodes if n.vlan_ip
+    }
+    orphans = parse_orphans(out, desired_names, desired_addrs)
     cilium = probe.check(
         ["kubectl", "--kubeconfig", kc, "get", "ds", "-n", "kube-system", "cilium"], env
     )

@@ -13,12 +13,13 @@ def _node(name="cp1", role=NodeRole.CONTROLPLANE, ip="10.0.0.1", gateway="10.0.0
     return Node(name=name, role=role, cpu=CpuVendor.AMD, ip=ip, gateway=gateway)
 
 
-def _snap(states=None, *, k8s=False, cilium=False):
+def _snap(states=None, *, k8s=False, cilium=False, etcd=False):
     return Snapshot(
         states=states or {},
         orphans=[],
         k8s_reachable=k8s,
         cilium_installed=cilium,
+        etcd_bootstrapped=etcd,
     )
 
 
@@ -159,33 +160,35 @@ def test_edit_firmware_empty_clears_to_none(tmp_path, monkeypatch):
 
 
 def test_delete_node_confirmed(tmp_path, monkeypatch):
-    node = _node()
-    keep = _node("worker1", role=NodeRole.WORKER)
-    cluster = Cluster(nodes=[node, keep], name="c")
+    cp = _node()
+    victim = _node("worker1", role=NodeRole.WORKER)
+    cluster = Cluster(nodes=[cp, victim], name="c")
     state = _state(tmp_path, cluster, _snap({"cp1": NodeState.ABSENT, "worker1": NodeState.ABSENT}))
     monkeypatch.setattr(screens, "confirm", lambda *a, **k: True)
 
-    it = _find(screens.node_menu(state, node), "Delete node")
+    it = _find(screens.node_menu(state, victim), "Delete node")
     assert it.run() is BACK
-    assert node not in cluster.nodes
-    assert [n.name for n in definition.load(state.ctx.paths.defn).nodes] == ["worker1"]
+    assert victim not in cluster.nodes
+    assert [n.name for n in definition.load(state.ctx.paths.defn).nodes] == ["cp1"]
 
 
 def test_delete_node_declined(tmp_path, monkeypatch):
-    node = _node()
-    cluster = Cluster(nodes=[node], name="c")
-    state = _state(tmp_path, cluster, _snap({"cp1": NodeState.ABSENT}))
+    cp = _node()
+    victim = _node("worker1", role=NodeRole.WORKER)
+    cluster = Cluster(nodes=[cp, victim], name="c")
+    state = _state(tmp_path, cluster, _snap({"cp1": NodeState.ABSENT, "worker1": NodeState.ABSENT}))
     monkeypatch.setattr(screens, "confirm", lambda *a, **k: False)
 
-    it = _find(screens.node_menu(state, node), "Delete node")
+    it = _find(screens.node_menu(state, victim), "Delete node")
     assert it.run() is STAY
-    assert node in cluster.nodes
+    assert victim in cluster.nodes
 
 
 def test_delete_live_node_warns(tmp_path, monkeypatch):
-    node = _node()
-    cluster = Cluster(nodes=[node], name="c")
-    state = _state(tmp_path, cluster, _snap({"cp1": NodeState.JOINED}))
+    cp = _node()
+    victim = _node("worker1", role=NodeRole.WORKER)
+    cluster = Cluster(nodes=[cp, victim], name="c")
+    state = _state(tmp_path, cluster, _snap({"cp1": NodeState.JOINED, "worker1": NodeState.JOINED}))
     seen = {}
 
     def fake_confirm(label, **k):
@@ -193,9 +196,23 @@ def test_delete_live_node_warns(tmp_path, monkeypatch):
         return True
 
     monkeypatch.setattr(screens, "confirm", fake_confirm)
-    _find(screens.node_menu(state, node), "Delete node").run()
+    _find(screens.node_menu(state, victim), "Delete node").run()
     assert "live" in seen["label"]
-    assert node not in cluster.nodes
+    assert victim not in cluster.nodes
+
+
+def test_delete_last_control_plane_blocked(tmp_path, monkeypatch):
+    """The lone control-plane can't be deleted; the menu refuses before the confirm prompt."""
+    node = _node()  # sole CP
+    cluster = Cluster(nodes=[node, _node("worker1", role=NodeRole.WORKER)], name="c")
+    state = _state(tmp_path, cluster, _snap({"cp1": NodeState.ABSENT, "worker1": NodeState.ABSENT}))
+    confirmed: list[int] = []
+    monkeypatch.setattr(screens, "confirm", lambda *a, **k: confirmed.append(1) or True)
+
+    it = _find(screens.node_menu(state, node), "Delete node")
+    assert it.run() is STAY
+    assert node in cluster.nodes  # refused
+    assert confirmed == []  # never reached the confirm prompt
 
 
 # vswitch --------------------------------------------------------------------
@@ -321,6 +338,25 @@ def test_main_menu_always_has_enabled_item(tmp_path):
     state = _state(tmp_path, cluster)
     items = screens.main_menu(state).items()
     assert any(not it.disabled for it in items)
+
+
+def test_header_renders_without_control_plane(tmp_path, monkeypatch):
+    """No-CP topology (e.g. last CP deleted): the header gates compute() behind `not problems`,
+    so bootstrap_cp is never reached and the render doesn't crash."""
+    cluster = Cluster(nodes=[_node("worker1", role=NodeRole.WORKER)], name="c")
+    state = _state(tmp_path, cluster, _snap({"worker1": NodeState.ABSENT}))
+    monkeypatch.setattr(screens, "note", lambda *a, **k: None)
+    screens.main_menu(state).header()  # no ValueError from cluster.bootstrap_cp
+
+
+def test_header_renders_with_unsurveyed_node(tmp_path, monkeypatch):
+    """A node added after the survey is missing from snap.states; the header's compute() must
+    treat it as absent rather than KeyError."""
+    cluster = Cluster(nodes=[_node(), _node("worker9", role=NodeRole.WORKER)], name="c")
+    snap = _snap({"cp1": NodeState.JOINED}, etcd=True)  # worker9 absent from the survey
+    state = _state(tmp_path, cluster, snap)
+    monkeypatch.setattr(screens, "note", lambda *a, **k: None)
+    screens.main_menu(state).header()  # no KeyError
 
 
 def test_nodes_menu_lists_nodes(tmp_path):

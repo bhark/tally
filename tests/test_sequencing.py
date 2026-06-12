@@ -18,9 +18,13 @@ def _ctx(tmp_path, cluster=None):
     return Ctx(cluster=cluster or default_cluster(), paths=paths)
 
 
-def _snap(states, *, cilium=False, orphans=None, k8s=True) -> Snapshot:
+def _snap(states, *, cilium=False, orphans=None, k8s=True, etcd=False) -> Snapshot:
     return Snapshot(
-        states=states, orphans=orphans or [], k8s_reachable=k8s, cilium_installed=cilium
+        states=states,
+        orphans=orphans or [],
+        k8s_reachable=k8s,
+        cilium_installed=cilium,
+        etcd_bootstrapped=etcd,
     )
 
 
@@ -85,8 +89,8 @@ def test_existing_cluster_skips_joined_nodes_and_bootstrap(tmp_path, monkeypatch
     seq = _record(monkeypatch)
     monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: True)
     ctx = _ctx(tmp_path)
-    ctx.paths.kubeconfig.write_text("kube\n")  # already bootstrapped → cluster_up
-    snap = _snap({"cp1": NodeState.JOINED, "worker1": NodeState.ABSENT}, cilium=True)
+    ctx.paths.kubeconfig.write_text("kube\n")  # already bootstrapped
+    snap = _snap({"cp1": NodeState.JOINED, "worker1": NodeState.ABSENT}, cilium=True, etcd=True)
 
     wizard._bring_up(ctx, snap)
 
@@ -109,7 +113,7 @@ def test_bootstrapped_but_cilium_absent_reinstalls(tmp_path, monkeypatch):
     monkeypatch.setattr(wizard.prompts, "ask", lambda label, *, default: True)
     ctx = _ctx(tmp_path)
     ctx.paths.kubeconfig.write_text("kube\n")
-    snap = _snap({"cp1": NodeState.JOINED, "worker1": NodeState.JOINED}, cilium=False)
+    snap = _snap({"cp1": NodeState.JOINED, "worker1": NodeState.JOINED}, cilium=False, etcd=True)
 
     wizard._bring_up(ctx, snap)
 
@@ -187,12 +191,18 @@ def test_cancel_aborts_remaining_phases(tmp_path, monkeypatch):
 
 
 def _converge_node(tmp_path, monkeypatch):
-    """A joined node reachable enough for a dry-run: ip + talosconfig + talosctl on PATH."""
+    """A joined node reachable enough for a dry-run: ip + talosconfig + talosctl on PATH.
+
+    The secure disk re-pin is stubbed off by default (selector None -> no re-render) so the
+    dispatch tests stay hermetic; the re-pin test overrides it.
+    """
     ctx = _ctx(tmp_path)
     ctx.paths.talosconfig.write_text("cfg\n")
     node = ctx.cluster.bootstrap_cp
     node.ip = "1.2.3.4"
     monkeypatch.setattr(wizard.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(wizard.disk, "resolve_system_selector", lambda ip, env, *, secure: None)
+    monkeypatch.setattr(wizard, "render_node", lambda ctx, n: None)
     phases: list[str] = []
     applied: list[str] = []
     monkeypatch.setattr(wizard, "_run_phase", lambda ctx, sd, node: phases.append(sd.key.value))
@@ -205,6 +215,26 @@ def test_converge_in_sync_does_not_apply(tmp_path, monkeypatch):
     monkeypatch.setattr(wizard, "dry_run", lambda ctx, node: (DryRunVerdict.IN_SYNC, ""))
     wizard._converge(ctx, node)
     assert phases == [] and applied == []
+
+
+def test_converge_repins_disk_over_secure_api(tmp_path, monkeypatch):
+    """Converge re-derives the boot-disk selector over the secure API and re-renders, so a
+    pinned node dry-runs in sync instead of showing perpetual machine.install drift."""
+    ctx, node, phases, applied = _converge_node(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        wizard.disk,
+        "resolve_system_selector",
+        lambda ip, env, *, secure: {"wwid": "w"} if secure else None,
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(wizard, "render_node", lambda ctx, n: rendered.append(n.name))
+    monkeypatch.setattr(wizard, "dry_run", lambda ctx, node: (DryRunVerdict.IN_SYNC, ""))
+
+    wizard._converge(ctx, node)
+
+    assert node.resolved_install.selector == {"wwid": "w"}
+    assert rendered == [node.name]  # re-rendered with the pin before the dry-run
+    assert phases == [] and applied == []  # in sync -> no apply
 
 
 def test_converge_no_reboot_applies_without_wait(tmp_path, monkeypatch):
@@ -236,13 +266,16 @@ def test_converge_reboot_declined_skips(tmp_path, monkeypatch):
 def test_bring_up_removes_orphan_after_cilium(tmp_path, monkeypatch):
     _record(monkeypatch)
     ctx = _ctx(tmp_path)
-    ctx.paths.kubeconfig.write_text("kube\n")  # cluster_up
+    ctx.paths.kubeconfig.write_text("kube\n")
     orphan = Orphan(name="oldworker", addresses=["5.6.7.8"], control_plane=False)
     snap = _snap(
-        {"cp1": NodeState.JOINED, "worker1": NodeState.JOINED}, cilium=True, orphans=[orphan]
+        {"cp1": NodeState.JOINED, "worker1": NodeState.JOINED},
+        cilium=True,
+        orphans=[orphan],
+        etcd=True,
     )
     monkeypatch.setattr(wizard, "missing_for_stage", lambda stage: [])
-    monkeypatch.setattr(wizard.removal, "repoint_endpoints", lambda cluster, env: None)
+    monkeypatch.setattr(wizard.cluster_ops, "set_endpoints", lambda cluster, env: None)
     monkeypatch.setattr(wizard.removal, "protect_kubeconfig", lambda cluster, paths, orphans: None)
     removed: list[tuple[str, bool]] = []
     monkeypatch.setattr(
@@ -258,12 +291,12 @@ def test_bring_up_removes_orphan_after_cilium(tmp_path, monkeypatch):
     assert removed == [("oldworker", True)]
 
 
-def test_confirm_and_remove_honors_refusal_hint(tmp_path, monkeypatch):
-    """A refusal hint (would strand the control-plane) short-circuits before any prompt."""
+def test_confirm_and_remove_honors_refusal(tmp_path, monkeypatch):
+    """A refused removal (would strand the control-plane) short-circuits before any prompt."""
     ctx = _ctx(tmp_path)
     orphan = Orphan(name="oldcp", addresses=["1.1.1.1"], control_plane=True)
     action = Action(
-        ActionKind.REMOVE, orphan=orphan, hint="refusing: would leave zero control-planes"
+        ActionKind.REMOVE, orphan=orphan, refuse=True, hint="would leave zero control-planes"
     )
     called: list[int] = []
     asked: list[int] = []

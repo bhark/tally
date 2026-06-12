@@ -10,8 +10,7 @@ from __future__ import annotations
 
 from griphtui import confirm, is_cancel, note, warn
 
-from . import probe
-from .constants import K8S_API_PORT
+from . import cluster_ops, probe
 from .runner import CommandError, run
 from .stages.base import StageError
 
@@ -19,45 +18,47 @@ _RESET_GONE_TIMEOUT = 300
 _DRAIN_TIMEOUT = "120s"
 
 
-def reachable_address(cluster, env, orphan) -> str | None:
-    """first orphan address answering the secure api proxied through the bootstrap CP, else None."""
-    cp = cluster.bootstrap_cp
+def _proxy_cp(cluster, env):
+    """first desired control-plane whose secure api answers - the live etcd-leave proxy, or None.
+
+    bootstrap_cp may be down (fresh/failed bring-up), and proxying a reset through a dead
+    endpoint silently skips the graceful etcd leave; pick a CP that actually answers instead.
+    """
+    for cp in cluster.control_planes:
+        if cp.ip and probe.check(["talosctl", "-e", cp.ip, "-n", cp.ip, "version"], env):
+            return cp
+    return None
+
+
+def reachable_address(cp, env, orphan) -> str | None:
+    """first orphan address answering the secure api proxied through cp, else None."""
     for addr in orphan.addresses:
         if probe.check(["talosctl", "-e", cp.ip, "-n", addr, "version"], env):
             return addr
     return None
 
 
-def repoint_endpoints(cluster, env) -> None:
-    """point talosconfig at the desired CP public IPs (operator hop); call once before removal."""
-    cp_ips = [n.ip for n in cluster.control_planes]
-    run(["talosctl", "config", "endpoint", *cp_ips], label="Repoint talosconfig endpoints", env=env)
-
-
 def protect_kubeconfig(cluster, paths, orphans) -> None:
     """repoint the kubeconfig server off any orphan to the bootstrap CP - don't saw the branch."""
     if not paths.kubeconfig.exists():
         return
-    text = paths.kubeconfig.read_text()
-    public = f"https://{cluster.bootstrap_cp.ip}:{K8S_API_PORT}"
+    target = cluster.bootstrap_cp.ip
     for orphan in orphans:
         for addr in orphan.addresses:
-            server = f"https://{addr}:{K8S_API_PORT}"
-            if server in text:
-                paths.kubeconfig.write_text(text.replace(server, public))
-                note(f"Rewrote kubeconfig server {server} → {public}")
+            if cluster_ops.rewrite_kubeconfig_server(paths.kubeconfig, addr, target):
+                note(f"Rewrote kubeconfig server off orphan {addr} → {target}")
                 return
 
 
 def remove_orphan(cluster, paths, env, orphan, *, wipe_all: bool) -> None:
     """drain (workers) -> reset (proxied) -> wait gone -> etcd verify (CP) -> delete -> purge."""
-    addr = reachable_address(cluster, env, orphan)
-    cp = cluster.bootstrap_cp
+    cp = _proxy_cp(cluster, env)
+    addr = reachable_address(cp, env, orphan) if cp is not None else None
 
     if not orphan.control_plane:
         _drain_worker(paths, env, orphan)
 
-    if addr is not None:
+    if cp is not None and addr is not None:
         _reset_and_wait(cp, env, orphan, addr, wipe_all=wipe_all)
         if orphan.control_plane:
             _show_etcd_members(cp, env)

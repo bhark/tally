@@ -29,6 +29,8 @@ class Action:
     node: Node | None = None
     orphan: Orphan | None = None
     hint: str | None = None
+    state: NodeState | None = None  # observed state the action derives from (node actions)
+    refuse: bool = False  # plan-level veto: surfaced but never executed
 
 
 @dataclass(slots=True)
@@ -46,13 +48,13 @@ def _ordered_nodes(cluster: Cluster) -> list[Node]:
     return [head, *(n for n in cluster.nodes if n is not head)]
 
 
-def _node_action(node: Node, state: NodeState, *, cluster_up: bool) -> Action:
+def _node_action(node: Node, state: NodeState, *, etcd_bootstrapped: bool) -> Action:
     if state is NodeState.ABSENT:
-        return Action(ActionKind.BRING_UP, node=node)
+        return Action(ActionKind.BRING_UP, node=node, state=state)
     if state is NodeState.MAINTENANCE:
-        return Action(ActionKind.APPLY, node=node)
-    kind = ActionKind.CONVERGE if cluster_up else ActionKind.REAPPLY
-    return Action(kind, node=node)
+        return Action(ActionKind.APPLY, node=node, state=state)
+    kind = ActionKind.CONVERGE if etcd_bootstrapped else ActionKind.REAPPLY
+    return Action(kind, node=node, state=state)
 
 
 def _remove_actions(cluster: Cluster, snap: Snapshot) -> list[Action]:
@@ -75,7 +77,8 @@ def _remove_actions(cluster: Cluster, snap: Snapshot) -> list[Action]:
                 Action(
                     ActionKind.REMOVE,
                     orphan=orphan,
-                    hint="refusing: would leave zero control-planes",
+                    refuse=True,
+                    hint="would leave zero control-planes",
                 )
             )
             continue  # not removed; later orphans still see it as present
@@ -88,21 +91,21 @@ def _remove_actions(cluster: Cluster, snap: Snapshot) -> list[Action]:
     return out
 
 
-def compute(cluster: Cluster, snap: Snapshot, *, cluster_up: bool) -> Plan:
+def compute(cluster: Cluster, snap: Snapshot) -> Plan:
     actions = [
-        _node_action(node, snap.states[node.name], cluster_up=cluster_up)
+        _node_action(
+            node,
+            snap.states.get(node.name, NodeState.ABSENT),  # unsurveyed edit ⇒ absent ⇒ bring-up
+            etcd_bootstrapped=snap.etcd_bootstrapped,
+        )
         for node in _ordered_nodes(cluster)
     ]
     actions += _remove_actions(cluster, snap)
-    return Plan(actions=actions, bootstrap=not cluster_up, cilium=not snap.cilium_installed)
-
-
-_KIND_TO_STATE = {
-    ActionKind.BRING_UP: NodeState.ABSENT,
-    ActionKind.APPLY: NodeState.MAINTENANCE,
-    ActionKind.CONVERGE: NodeState.JOINED,
-    ActionKind.REAPPLY: NodeState.JOINED,
-}
+    return Plan(
+        actions=actions,
+        bootstrap=not snap.etcd_bootstrapped,
+        cilium=not snap.cilium_installed,
+    )
 
 
 def describe(plan: Plan) -> list[str]:
@@ -112,11 +115,13 @@ def describe(plan: Plan) -> list[str]:
         lines.append("cluster: " + " + ".join(flags))
     for a in plan.actions:
         if a.node is not None:
-            lines.append(f"{a.node.name}  {_KIND_TO_STATE[a.kind]} -> {a.kind}")
+            lines.append(f"{a.node.name}  {a.state} -> {a.kind}")
         elif a.orphan is not None:
             addr = a.orphan.addresses[0] if a.orphan.addresses else "?"
             lines.append(f"orphan {a.orphan.name} ({addr}) -> {a.kind}")
-        if a.hint:
+        if a.refuse:
+            lines.append(f"  [refusing: {a.hint}]")
+        elif a.hint:
             lines.append(f"  [{a.hint}]")
     return lines
 
